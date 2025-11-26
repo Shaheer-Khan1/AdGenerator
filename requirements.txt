@@ -1,5 +1,5 @@
 # Memory-optimized dependencies for 2-4GB instances
-# Removed: whisper, moviepy, pillow, torch, numpy (saves ~1.5GB+ RAM)
+# Whisper included for audio transcription feature
 
 fastapi==0.116.1
 uvicorn==0.35.0
@@ -7,6 +7,11 @@ pydantic==2.11.7
 python-dotenv==1.1.1
 requests==2.32.4
 imageio-ffmpeg==0.6.0
+python-multipart==0.0.20
+openai-whisper==20231117
+google-generativeai==0.8.5
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
 
 # Optional: Remove elevenlabs if using a different TTS API
 elevenlabs==0.2.27

@@ -1,0 +1,40 @@
+{
+  "Glow Coffee": {
+    "videos": [
+      {"id": "YOUR_FILE_ID_1", "name": "coffee_pour_sarah.mp4"},
+      {"id": "YOUR_FILE_ID_2", "name": "skincare_sarah.mp4"},
+      {"id": "YOUR_FILE_ID_3", "name": "product_closeup.mp4"}
+    ]
+  },
+  "Hair": {
+    "videos": [
+      {"id": "YOUR_FILE_ID_4", "name": "hair_brush_maria.mp4"},
+      {"id": "YOUR_FILE_ID_5", "name": "shiny_hair_maria.mp4"}
+    ]
+  },
+  "Product": {
+    "videos": [
+      {"id": "YOUR_FILE_ID_6", "name": "product_packaging.mp4"},
+      {"id": "YOUR_FILE_ID_7", "name": "before_after.mp4"}
+    ]
+  },
+  "Cellulite": {
+    "videos": []
+  },
+  "Joints": {
+    "videos": []
+  },
+  "Menopause": {
+    "videos": []
+  },
+  "Nails": {
+    "videos": []
+  },
+  "Others": {
+    "videos": []
+  },
+  "Wrinkles": {
+    "videos": []
+  }
+}
+

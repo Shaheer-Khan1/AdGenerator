@@ -1,108 +1,543 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>AI Video Generator</title>
-  <style>
-    body { font-family: Arial; margin: 2em; background: #f9f9f9; }
-    input, textarea, button { width: 100%; margin-top: 0.5em; padding: 0.5em; }
-    #status { margin-top: 1em; font-weight: bold; }
-    #videoPlayer { width: 100%; max-width: 720px; margin-top: 1em; display: none; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Video Generator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 600px;
+            width: 100%;
+            padding: 40px;
+        }
+
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 32px;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+
+        .form-group {
+            margin-bottom: 25px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        input[type="text"],
+        textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e1e8ed;
+            border-radius: 10px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+            font-family: inherit;
+        }
+
+        input[type="text"]:focus,
+        textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        textarea {
+            min-height: 100px;
+            resize: vertical;
+        }
+
+        .file-upload {
+            position: relative;
+            display: inline-block;
+            width: 100%;
+        }
+
+        .file-upload input[type="file"] {
+            display: none;
+        }
+
+        .file-upload-label {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            border: 2px dashed #667eea;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: #f8f9fa;
+        }
+
+        .file-upload-label:hover {
+            background: #e8eaf6;
+            border-color: #764ba2;
+        }
+
+        .file-upload-label.has-file {
+            border-color: #4caf50;
+            background: #e8f5e9;
+        }
+
+        .upload-icon {
+            font-size: 32px;
+            margin-right: 10px;
+        }
+
+        button {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .status {
+            margin-top: 25px;
+            padding: 15px;
+            border-radius: 10px;
+            display: none;
+        }
+
+        .status.show {
+            display: block;
+        }
+
+        .status.success {
+            background: #e8f5e9;
+            color: #2e7d32;
+            border: 1px solid #4caf50;
+        }
+
+        .status.error {
+            background: #ffebee;
+            color: #c62828;
+            border: 1px solid #f44336;
+        }
+
+        .status.processing {
+            background: #e3f2fd;
+            color: #1565c0;
+            border: 1px solid #2196f3;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 6px;
+            background: #e1e8ed;
+            border-radius: 3px;
+            margin-top: 10px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            width: 0%;
+            transition: width 0.3s;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+
+        .download-btn {
+            margin-top: 15px;
+            background: #4caf50;
+            background: linear-gradient(135deg, #4caf50 0%, #45a049 100%);
+        }
+
+        .download-btn:hover {
+            box-shadow: 0 10px 20px rgba(76, 175, 80, 0.4);
+        }
+
+        .note {
+            font-size: 12px;
+            color: #999;
+            margin-top: 5px;
+        }
+
+        .switch-mode {
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 14px;
+            color: #666;
+        }
+
+        .switch-link {
+            color: #667eea;
+            cursor: pointer;
+            text-decoration: underline;
+            font-weight: 600;
+        }
+
+        .mode-ai, .mode-upload {
+            display: none;
+        }
+
+        .mode-ai.active, .mode-upload.active {
+            display: block;
+        }
+    </style>
 </head>
 <body>
-  <h1>AI Video Generator</h1>
+    <div class="container">
+        <h1>🎬 AI Video Generator</h1>
+        <p class="subtitle">Create stunning vertical videos with captions</p>
 
-  <label for="script">Script Text</label>
-  <textarea id="script" rows="6" placeholder="Enter script text..."></textarea>
+        <div class="switch-mode">
+            <span id="switchText">Want to use your own voice? <span class="switch-link" onclick="toggleMode()">Upload Audio</span></span>
+        </div>
 
-  <label for="query">Search Query (e.g., nature, technology)</label>
-  <input id="query" placeholder="Search keyword for videos" value="technology" />
+        <!-- AI Mode (ElevenLabs) -->
+        <form id="aiForm" class="mode-ai active">
+            <div class="form-group">
+                <label>📝 Script Text</label>
+                <textarea id="scriptTextAI" placeholder="Enter your video script here..." required></textarea>
+                <div class="note">This will be converted to speech using AI</div>
+            </div>
 
-  <button onclick="startGeneration()">Generate Video</button>
+            <button type="submit" id="generateBtnAI">
+                ✨ Generate Video with AI Voice
+            </button>
+        </form>
 
-  <div id="status"></div>
-  <video id="videoPlayer" controls></video>
-  <a id="downloadLink" href="#" style="display:none;" download>Download Video</a>
+        <!-- Upload Mode -->
+        <form id="uploadForm" class="mode-upload">
+            <div class="form-group">
+                <label>🎤 Upload Your Voiceover</label>
+                <div class="file-upload">
+                    <input type="file" id="audioFile" accept=".mp3,.wav,.m4a,.aac" required>
+                    <label for="audioFile" class="file-upload-label" id="fileLabel">
+                        <span class="upload-icon">📁</span>
+                        <span id="fileName">Click to upload audio file (MP3, WAV, M4A)</span>
+                    </label>
+                </div>
+                <div class="note">Upload your pre-recorded voiceover</div>
+            </div>
 
-  <script>
-    let taskId = null;
-    let pollInterval = null;
+            <!-- Transcription Box -->
+            <div id="transcriptionBox" style="display: none; margin-bottom: 20px;">
+                <label style="display: block; margin-bottom: 8px; color: #333; font-weight: 600; font-size: 14px;">📝 Transcription</label>
+                <div id="transcriptionLoading" style="padding: 15px; background: #e3f2fd; border-radius: 10px; color: #1565c0; border: 1px solid #2196f3;">
+                    ⏳ Transcribing your audio with Whisper AI...
+                </div>
+                <div id="transcriptionText" style="display: none; padding: 15px; background: #e8f5e9; border-radius: 10px; color: #2e7d32; border: 1px solid #4caf50; line-height: 1.6; white-space: pre-wrap;"></div>
+                
+                <!-- Suggested Folder -->
+                <div id="suggestedFolder" style="display: none; margin-top: 15px; padding: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; color: white;">
+                    <div style="font-weight: 600; margin-bottom: 5px;">🎬 Suggested Footage Folder:</div>
+                    <div id="folderName" style="font-size: 18px; font-weight: bold;"></div>
+                </div>
+            </div>
 
-    function startGeneration() {
-      const script = document.getElementById("script").value;
-      const query = document.getElementById("query").value;
+            <button type="submit" id="generateBtnUpload">
+                🚀 Generate Video with Your Audio
+            </button>
+        </form>
 
-      if (script.length < 10) {
-        alert("Script text must be at least 10 characters long.");
-        return;
-      }
+        <!-- Status -->
+        <div id="status" class="status">
+            <div id="statusText"></div>
+            <div class="progress-bar">
+                <div class="progress-fill"></div>
+            </div>
+        </div>
 
-      document.getElementById("status").innerText = "Submitting task...";
-      document.getElementById("downloadLink").style.display = "none";
-      document.getElementById("videoPlayer").style.display = "none";
+        <button id="downloadBtn" class="download-btn" style="display: none;">
+            ⬇️ Download Video
+        </button>
+    </div>
 
-      fetch("http://localhost:8000/generate-video", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ script_text: script, search_query: query })
-      })
-      .then(res => res.json())
-      .then(data => {
-        taskId = data.task_id;
-        document.getElementById("status").innerText = "Task started. Polling status...";
-        pollInterval = setInterval(checkStatus, 3000);
-      })
-      .catch(err => {
-        console.error(err);
-        document.getElementById("status").innerText = "Error submitting task.";
-      });
-    }
+    <script>
+        let currentMode = 'ai';
+        let currentTaskId = null;
+        let statusInterval = null;
+        let selectedFolders = [];
 
-    function checkStatus() {
-      if (!taskId) return;
+        const API_URL = window.location.origin;
 
-      fetch(`http://localhost:8000/task/${taskId}`)
-      .then(res => res.json())
-      .then(data => {
-        document.getElementById("status").innerText = `${data.status.toUpperCase()}: ${data.progress || "Working..."}`;
-
-        if (data.status === "completed") {
-          clearInterval(pollInterval);
-          loadVideo();
-        } else if (data.status === "failed") {
-          clearInterval(pollInterval);
-          document.getElementById("status").innerText = "❌ Failed: " + (data.error || "Unknown error");
+        // Toggle between AI and Upload mode
+        function toggleMode() {
+            currentMode = currentMode === 'ai' ? 'upload' : 'ai';
+            
+            document.querySelectorAll('.mode-ai, .mode-upload').forEach(el => {
+                el.classList.remove('active');
+            });
+            
+            if (currentMode === 'ai') {
+                document.querySelector('.mode-ai').classList.add('active');
+                document.getElementById('switchText').innerHTML = 
+                    'Want to use your own voice? <span class="switch-link" onclick="toggleMode()">Upload Audio</span>';
+            } else {
+                document.querySelector('.mode-upload').classList.add('active');
+                document.getElementById('switchText').innerHTML = 
+                    'Want to use AI voice? <span class="switch-link" onclick="toggleMode()">Use ElevenLabs</span>';
+            }
         }
-      })
-      .catch(err => {
-        console.error(err);
-        clearInterval(pollInterval);
-        document.getElementById("status").innerText = "Error checking status.";
-      });
-    }
 
-    function loadVideo() {
-      const videoPlayer = document.getElementById("videoPlayer");
-      const downloadLink = document.getElementById("downloadLink");
-      const videoUrl = `http://localhost:8000/download/${taskId}`;
+        // File upload handling with transcription
+        document.getElementById('audioFile').addEventListener('change', async function(e) {
+            const file = e.target.files[0];
+            const label = document.getElementById('fileLabel');
+            const fileName = document.getElementById('fileName');
+            const transcriptionBox = document.getElementById('transcriptionBox');
+            const transcriptionLoading = document.getElementById('transcriptionLoading');
+            const transcriptionText = document.getElementById('transcriptionText');
+            
+            if (file) {
+                fileName.textContent = `✓ ${file.name}`;
+                label.classList.add('has-file');
+                
+                // Show transcription box with loading
+                transcriptionBox.style.display = 'block';
+                transcriptionLoading.style.display = 'block';
+                transcriptionText.style.display = 'none';
+                
+                // Transcribe the audio
+                try {
+                    const formData = new FormData();
+                    formData.append('audio_file', file);
+                    
+                    const response = await fetch(`${API_URL}/transcribe-audio`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    const result = await response.json();
+                    
+                    // Hide loading, show result
+                    transcriptionLoading.style.display = 'none';
+                    transcriptionText.style.display = 'block';
+                    
+                    if (result.success) {
+                        transcriptionText.textContent = result.transcription;
+                        transcriptionText.style.background = '#e8f5e9';
+                        transcriptionText.style.color = '#2e7d32';
+                        transcriptionText.style.borderColor = '#4caf50';
+                        
+                        // Store suggested folders for generation
+                        if (result.suggested_folders && result.suggested_folders.length > 0) {
+                            selectedFolders = result.suggested_folders;
+                            const suggestedFolderEl = document.getElementById('suggestedFolder');
+                            const folderName = document.getElementById('folderName');
+                            
+                            // Display all folders with video descriptions
+                            let folderDisplay = selectedFolders.map((folder, idx) => {
+                                const folderName = folder.name || folder;
+                                const videos = folder.videos || [];
+                                const videoList = videos.length > 0 ? ` (${videos.join(', ')})` : '';
+                                return `${idx + 1}. ${folderName}${videoList}`;
+                            }).join('\n');
+                            
+                            folderName.textContent = `${selectedFolders.length} folders selected:\n${folderDisplay}`;
+                            folderName.style.whiteSpace = 'pre-line';
+                            folderName.style.fontSize = '13px';
+                            suggestedFolderEl.style.display = 'block';
+                        } else if (result.primary_folder) {
+                            // Fallback to single folder
+                            selectedFolders = [{name: result.primary_folder, videos: []}];
+                            const suggestedFolderEl = document.getElementById('suggestedFolder');
+                            const folderName = document.getElementById('folderName');
+                            folderName.textContent = `${result.primary_folder} (will use themed Pexels videos)`;
+                            suggestedFolderEl.style.display = 'block';
+                        }
+                    } else {
+                        transcriptionText.textContent = result.transcription;
+                        transcriptionText.style.background = '#ffebee';
+                        transcriptionText.style.color = '#c62828';
+                        transcriptionText.style.borderColor = '#f44336';
+                    }
+                    
+                } catch (error) {
+                    transcriptionLoading.style.display = 'none';
+                    transcriptionText.style.display = 'block';
+                    transcriptionText.textContent = `Error: ${error.message}`;
+                    transcriptionText.style.background = '#ffebee';
+                    transcriptionText.style.color = '#c62828';
+                    transcriptionText.style.borderColor = '#f44336';
+                }
+            }
+        });
 
-      // Set up video player
-      videoPlayer.src = videoUrl;
-      videoPlayer.style.display = "block";
-      
-      // Set up download link
-      downloadLink.href = videoUrl;
-      downloadLink.style.display = "block";
-      downloadLink.textContent = "Download Video";
-      
-      document.getElementById("status").innerText = "✅ Video ready!";
+        // AI Form submission
+        document.getElementById('aiForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const scriptText = document.getElementById('scriptTextAI').value;
+            
+            await generateVideo({
+                script_text: scriptText,
+                search_query: 'technology'  // Default search query
+            }, '/generate-video');
+        });
 
-      // Start playing the video
-      videoPlayer.play().catch(err => {
-        console.error("Error playing video:", err);
-      });
-    }
-  </script>
+        // Upload Form submission
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const audioFile = document.getElementById('audioFile').files[0];
+            
+            if (!audioFile) {
+                showStatus('Please upload an audio file', 'error');
+                return;
+            }
+            
+            if (!selectedFolders || selectedFolders.length === 0) {
+                showStatus('Please wait for folder selection from Gemini...', 'error');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('audio_file', audioFile);
+            formData.append('suggested_folders', JSON.stringify(selectedFolders));  // Send multiple folders as JSON
+            formData.append('script_text', document.getElementById('transcriptionText').textContent || 'uploaded audio');
+            
+            await generateVideoWithUpload(formData);
+        });
+
+        async function generateVideo(data, endpoint) {
+            try {
+                showStatus('Starting video generation...', 'processing');
+                document.getElementById('generateBtnAI').disabled = true;
+                
+                const response = await fetch(`${API_URL}${endpoint}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+                
+                const result = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(result.detail || 'Failed to start video generation');
+                }
+                
+                currentTaskId = result.task_id;
+                pollStatus();
+                
+            } catch (error) {
+                showStatus(`Error: ${error.message}`, 'error');
+                document.getElementById('generateBtnAI').disabled = false;
+            }
+        }
+
+        async function generateVideoWithUpload(formData) {
+            try {
+                showStatus('Uploading audio and starting generation...', 'processing');
+                document.getElementById('generateBtnUpload').disabled = true;
+                
+                const response = await fetch(`${API_URL}/generate-video-upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(result.detail || 'Failed to start video generation');
+                }
+                
+                currentTaskId = result.task_id;
+                pollStatus();
+                
+            } catch (error) {
+                showStatus(`Error: ${error.message}`, 'error');
+                document.getElementById('generateBtnUpload').disabled = false;
+            }
+        }
+
+        function pollStatus() {
+            statusInterval = setInterval(async () => {
+                try {
+                    const response = await fetch(`${API_URL}/task/${currentTaskId}`);
+                    const data = await response.json();
+                    
+                    if (data.status === 'completed') {
+                        clearInterval(statusInterval);
+                        showStatus('✅ Video completed!', 'success');
+                        document.getElementById('downloadBtn').style.display = 'block';
+                        document.getElementById('generateBtnAI').disabled = false;
+                        document.getElementById('generateBtnUpload').disabled = false;
+                    } else if (data.status === 'failed') {
+                        clearInterval(statusInterval);
+                        showStatus(`❌ Failed: ${data.error}`, 'error');
+                        document.getElementById('generateBtnAI').disabled = false;
+                        document.getElementById('generateBtnUpload').disabled = false;
+                    } else {
+                        showStatus(`⏳ ${data.progress}`, 'processing');
+                    }
+                } catch (error) {
+                    clearInterval(statusInterval);
+                    showStatus(`Error checking status: ${error.message}`, 'error');
+                }
+            }, 2000);
+        }
+
+        function showStatus(text, type) {
+            const status = document.getElementById('status');
+            const statusText = document.getElementById('statusText');
+            
+            status.className = `status show ${type}`;
+            statusText.textContent = text;
+        }
+
+        document.getElementById('downloadBtn').addEventListener('click', () => {
+            window.location.href = `${API_URL}/download/${currentTaskId}`;
+        });
+    </script>
 </body>
 </html>
