@@ -198,10 +198,23 @@
             margin-top: 15px;
             background: #4caf50;
             background: linear-gradient(135deg, #4caf50 0%, #45a049 100%);
+            font-size: 18px;
+            font-weight: 700;
+            padding: 18px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            transition: all 0.3s;
         }
 
         .download-btn:hover {
-            box-shadow: 0 10px 20px rgba(76, 175, 80, 0.4);
+            box-shadow: 0 10px 25px rgba(76, 175, 80, 0.5);
+            transform: translateY(-2px);
+        }
+
+        .download-btn:active {
+            transform: translateY(0);
         }
 
         .note {
@@ -276,12 +289,6 @@
                     ⏳ Transcribing your audio with Whisper AI...
                 </div>
                 <div id="transcriptionText" style="display: none; padding: 15px; background: #e8f5e9; border-radius: 10px; color: #2e7d32; border: 1px solid #4caf50; line-height: 1.6; white-space: pre-wrap;"></div>
-                
-                <!-- Suggested Folder -->
-                <div id="suggestedFolder" style="display: none; margin-top: 15px; padding: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; color: white;">
-                    <div style="font-weight: 600; margin-bottom: 5px;">🎬 Suggested Footage Folder:</div>
-                    <div id="folderName" style="font-size: 18px; font-weight: bold;"></div>
-                </div>
             </div>
 
             <button type="submit" id="generateBtnUpload">
@@ -298,7 +305,8 @@
         </div>
 
         <button id="downloadBtn" class="download-btn" style="display: none;">
-            ⬇️ Download Video
+            <span>⬇️</span>
+            <span>Download Your Video</span>
         </button>
     </div>
 
@@ -307,6 +315,7 @@
         let currentTaskId = null;
         let statusInterval = null;
         let selectedFolders = [];
+        let uploadedAudioFile = null; // Store the uploaded file globally
 
         const API_URL = window.location.origin;
 
@@ -339,6 +348,7 @@
             const transcriptionText = document.getElementById('transcriptionText');
             
             if (file) {
+                uploadedAudioFile = file; // Store globally
                 fileName.textContent = `✓ ${file.name}`;
                 label.classList.add('has-file');
                 
@@ -369,31 +379,11 @@
                         transcriptionText.style.color = '#2e7d32';
                         transcriptionText.style.borderColor = '#4caf50';
                         
-                        // Store suggested folders for generation
+                        // Store suggested folders for generation (but don't display)
                         if (result.suggested_folders && result.suggested_folders.length > 0) {
                             selectedFolders = result.suggested_folders;
-                            const suggestedFolderEl = document.getElementById('suggestedFolder');
-                            const folderName = document.getElementById('folderName');
-                            
-                            // Display all folders with video descriptions
-                            let folderDisplay = selectedFolders.map((folder, idx) => {
-                                const folderName = folder.name || folder;
-                                const videos = folder.videos || [];
-                                const videoList = videos.length > 0 ? ` (${videos.join(', ')})` : '';
-                                return `${idx + 1}. ${folderName}${videoList}`;
-                            }).join('\n');
-                            
-                            folderName.textContent = `${selectedFolders.length} folders selected:\n${folderDisplay}`;
-                            folderName.style.whiteSpace = 'pre-line';
-                            folderName.style.fontSize = '13px';
-                            suggestedFolderEl.style.display = 'block';
                         } else if (result.primary_folder) {
-                            // Fallback to single folder
                             selectedFolders = [{name: result.primary_folder, videos: []}];
-                            const suggestedFolderEl = document.getElementById('suggestedFolder');
-                            const folderName = document.getElementById('folderName');
-                            folderName.textContent = `${result.primary_folder} (will use themed Pexels videos)`;
-                            suggestedFolderEl.style.display = 'block';
                         }
                     } else {
                         transcriptionText.textContent = result.transcription;
@@ -429,9 +419,8 @@
         document.getElementById('uploadForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             
-            const audioFile = document.getElementById('audioFile').files[0];
-            
-            if (!audioFile) {
+            // Use the globally stored file
+            if (!uploadedAudioFile) {
                 showStatus('Please upload an audio file', 'error');
                 return;
             }
@@ -442,7 +431,7 @@
             }
             
             const formData = new FormData();
-            formData.append('audio_file', audioFile);
+            formData.append('audio_file', uploadedAudioFile);
             formData.append('suggested_folders', JSON.stringify(selectedFolders));  // Send multiple folders as JSON
             formData.append('script_text', document.getElementById('transcriptionText').textContent || 'uploaded audio');
             
@@ -508,8 +497,8 @@
                     
                     if (data.status === 'completed') {
                         clearInterval(statusInterval);
-                        showStatus('✅ Video completed!', 'success');
-                        document.getElementById('downloadBtn').style.display = 'block';
+                        showStatus('✅ Video generated successfully! Your video is ready to download.', 'success');
+                        document.getElementById('downloadBtn').style.display = 'flex';
                         document.getElementById('generateBtnAI').disabled = false;
                         document.getElementById('generateBtnUpload').disabled = false;
                     } else if (data.status === 'failed') {
@@ -518,7 +507,20 @@
                         document.getElementById('generateBtnAI').disabled = false;
                         document.getElementById('generateBtnUpload').disabled = false;
                     } else {
-                        showStatus(`⏳ ${data.progress}`, 'processing');
+                        // Show detailed progress
+                        let progressText = data.progress;
+                        if (progressText.includes('cut')) {
+                            progressText = '✂️ ' + progressText;
+                        } else if (progressText.includes('Downloading')) {
+                            progressText = '⬇️ ' + progressText;
+                        } else if (progressText.includes('Compiling')) {
+                            progressText = '🎬 ' + progressText;
+                        } else if (progressText.includes('Merging')) {
+                            progressText = '🔊 ' + progressText;
+                        } else if (progressText.includes('captions')) {
+                            progressText = '💬 ' + progressText;
+                        }
+                        showStatus(`⏳ ${progressText}`, 'processing');
                     }
                 } catch (error) {
                     clearInterval(statusInterval);

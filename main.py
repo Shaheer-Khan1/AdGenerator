@@ -68,7 +68,7 @@ class VideoGenerationRequest(BaseModel):
 # === CAPTION SETTINGS (Hardcoded) ===
 # Subtle, natural captions with word-by-word sync
 # Memory impact: ~0MB (just text processing, no ML models)
-ADD_CAPTIONS = True  # Enabled for Render/Linux deployment
+ADD_CAPTIONS = False  # Disabled - user doesn't want captions
 WORDS_PER_CAPTION = 1  # Show 1 word at a time for best sync
 CAPTION_FONT_SIZE = 24  # Smaller, more subtle
 
@@ -817,40 +817,104 @@ def get_audio_duration(audio_path: str) -> float:
     return h * 3600 + m * 60 + s
 
 async def compile_videos(paths: List[str], target_duration: float, task_id: str):
-    """Compile videos to match target duration using FFmpeg"""
+    """Compile videos by switching between different videos every 3 seconds"""
     task_dir = TEMP_DIR / task_id
     output_path = task_dir / "compiled.mp4"
-    list_file = task_dir / "list.txt"
-    
-    # Create concat list with absolute paths and proper escaping for Windows
-    with open(list_file, "w", encoding="utf-8") as f:
-        current_dur = 0.0
-        idx = 0
-        while current_dur < target_duration and paths:
-            # Convert to absolute path and use forward slashes for FFmpeg
-            abs_path = Path(paths[idx % len(paths)]).resolve()
-            # FFmpeg on Windows needs forward slashes or escaped backslashes
-            path_str = str(abs_path).replace('\\', '/')
-            f.write(f"file '{path_str}'\n")
-            current_dur += 5  # Approximate, FFmpeg will handle
-            idx += 1
-    
     exe = ffmpeg.get_ffmpeg_exe()
     
-    # Try concat with re-encode (more reliable than copy)
-    cmd = [
+    log_task(task_id, "Creating dynamic video cuts...")
+    
+    # Simple approach: Just loop the entire sequence of videos until we have enough
+    video_segments = []
+    clip_duration = 3.0
+    current_time = 0.0
+    segment_idx = 0
+    
+    # Create concat list that repeats the video sequence
+    list_file = task_dir / "list.txt"
+    
+    # Calculate how many times we need to repeat the full sequence
+    # Each full sequence = len(paths) * 3 seconds
+    sequence_duration = len(paths) * clip_duration
+    full_repeats = int(target_duration / sequence_duration) + 2  # +2 to ensure we have enough
+    
+    with open(list_file, "w", encoding="utf-8") as f:
+        for repeat in range(full_repeats):
+            for video_idx, video_path in enumerate(paths):
+                # Use different 3-second segments from each video on each repeat
+                start_time = repeat * clip_duration
+                
+                # Create segment
+                segment_output = task_dir / f"segment_{segment_idx}.mp4"
+                
+                cut_cmd = [
+                    exe, "-y",
+                    "-ss", str(start_time),
+                    "-i", video_path,
+                    "-t", str(clip_duration),
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                    "-r", "30",  # Set framerate to 30fps for consistency
+                    "-an",  # Remove audio
+                    str(segment_output)
+                ]
+                
+                try:
+                    subprocess.run(cut_cmd, check=True, capture_output=True, text=True, timeout=60)
+                    
+                    # Verify segment exists and has reasonable size
+                    if Path(segment_output).exists() and Path(segment_output).stat().st_size > 10000:
+                        abs_path = Path(segment_output).resolve()
+                        path_str = str(abs_path).replace('\\', '/')
+                        f.write(f"file '{path_str}'\n")
+                        segment_idx += 1
+                        current_time += clip_duration
+                        
+                        if segment_idx % len(paths) == 0:  # After each full sequence
+                            log_task(task_id, f"Completed sequence {segment_idx // len(paths)} ({current_time:.1f}s)")
+                    else:
+                        # If segment is too small or doesn't exist, use from beginning
+                        Path(segment_output).unlink(missing_ok=True)
+                        
+                        # Retry from beginning of video
+                        cut_cmd[3] = "0"  # Start from 0
+                        subprocess.run(cut_cmd, check=True, capture_output=True, text=True, timeout=60)
+                        
+                        if Path(segment_output).exists():
+                            abs_path = Path(segment_output).resolve()
+                            path_str = str(abs_path).replace('\\', '/')
+                            f.write(f"file '{path_str}'\n")
+                            segment_idx += 1
+                            current_time += clip_duration
+                        
+                except subprocess.CalledProcessError as e:
+                    print(f"Failed to create segment {segment_idx}: {e.stderr}")
+                    Path(segment_output).unlink(missing_ok=True)
+                    continue
+                
+                # Stop if we have enough
+                if current_time >= target_duration + 3.0:  # Extra buffer
+                    break
+            
+            if current_time >= target_duration + 3.0:
+                break
+    
+    if segment_idx == 0:
+        raise Exception("Failed to create any video segments")
+    
+    log_task(task_id, f"Created {segment_idx} segments, concatenating to {target_duration:.1f}s...")
+    
+    # Concatenate without trimming - we'll trim during audio merge
+    concat_cmd = [
         exe, "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
-        "-t", str(target_duration),
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-        "-c:a", "aac", "-b:a", "128k",
+        "-r", "30",  # Consistent framerate
         str(output_path)
     ]
     
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=180)
-        log_task(task_id, "Videos compiled")
+        subprocess.run(concat_cmd, check=True, capture_output=True, text=True, timeout=300)
+        log_task(task_id, f"Videos compiled successfully")
     except subprocess.CalledProcessError as e:
-        # Log the actual error for debugging
         error_msg = f"FFmpeg concat failed: {e.stderr}"
         print(error_msg)
         raise Exception(error_msg)
@@ -859,17 +923,30 @@ async def compile_videos(paths: List[str], target_duration: float, task_id: str)
     return str(output_path)
 
 def merge_audio_video(video_path: str, audio_path: str, output_path: str):
-    """Merge audio with video using FFmpeg"""
+    """Merge audio with video using FFmpeg - video length will match audio length exactly"""
     exe = ffmpeg.get_ffmpeg_exe()
+    
+    # Get audio duration to ensure video matches it exactly
+    audio_duration = get_audio_duration(audio_path)
+    
     cmd = [
-        exe, "-y", "-i", video_path, "-i", audio_path,
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-        "-c:a", "aac", "-b:a", "128k",
-        "-shortest",
+        exe, "-y",
+        "-stream_loop", "-1",  # Loop video if needed
+        "-i", video_path,      # Input 0: video (will loop if audio is longer)
+        "-i", audio_path,      # Input 1: audio
+        "-map", "0:v",         # Map video from input 0
+        "-map", "1:a",         # Map audio from input 1
+        "-c:v", "libx264",     # Encode video
+        "-preset", "ultrafast",
+        "-crf", "28",
+        "-c:a", "aac",         # Encode audio to AAC
+        "-b:a", "192k",        # Higher audio bitrate for better quality
+        "-t", str(audio_duration),  # EXACT duration to match audio
+        "-shortest",           # Safety: end when audio ends
         output_path
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=180)
     except subprocess.CalledProcessError as e:
         error_msg = f"FFmpeg merge failed: {e.stderr}"
         print(error_msg)
@@ -983,17 +1060,31 @@ def format_srt_time(seconds: float) -> str:
 
 def add_modern_captions_with_ffmpeg(video_path: str, srt_path: str, output_path: str):
     """Add subtle, natural captions with word-by-word sync"""
+    import platform
     exe = ffmpeg.get_ffmpeg_exe()
     
-    # Escape path for FFmpeg (Linux-compatible)
+    # Properly escape path for FFmpeg on Windows vs Linux/Mac
     abs_srt_path = str(Path(srt_path).resolve())
-    srt_path_ffmpeg = abs_srt_path.replace('\\', '/').replace(':', '\\:')
+    
+    if platform.system() == 'Windows':
+        # Windows: Use forward slashes and escape special chars properly
+        # Replace backslashes with forward slashes
+        srt_path_ffmpeg = abs_srt_path.replace('\\', '/')
+        # Escape colons (but not the drive letter colon)
+        # e.g., C:/path/file.srt -> C\\:/path/file.srt
+        if len(srt_path_ffmpeg) > 1 and srt_path_ffmpeg[1] == ':':
+            srt_path_ffmpeg = srt_path_ffmpeg[0] + '\\:' + srt_path_ffmpeg[2:]
+        # Escape special characters for FFmpeg filter
+        srt_path_ffmpeg = srt_path_ffmpeg.replace("'", "'\\\\\\''")
+    else:
+        # Linux/Mac: Standard escaping
+        srt_path_ffmpeg = abs_srt_path.replace('\\', '/').replace(':', '\\:')
     
     # Subtle caption style: Small white text, thin black outline, no background
     cmd = [
         exe, "-y", "-i", video_path,
         "-vf", (
-            f"subtitles={srt_path_ffmpeg}:force_style='"
+            f"subtitles='{srt_path_ffmpeg}':force_style='"
             f"FontName=Arial,FontSize={CAPTION_FONT_SIZE},Bold=0,"
             f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"  # White text, black outline
             f"BorderStyle=1,Outline=2,Shadow=0,"  # Thin outline, no shadow
@@ -1043,7 +1134,7 @@ async def process_video_generation(request: VideoGenerationRequest, task_id: str
         
         if drive_videos and all(v.get('id') for v in drive_videos):
             # Use Drive videos
-            log_task(task_id, f"Using {len(drive_videos)} videos from Drive...")
+            log_task(task_id, "Preparing video footage...")
             downloaded = await download_drive_videos(drive_videos, task_id)
         else:
             # Use Pexels videos
@@ -1052,7 +1143,7 @@ async def process_video_generation(request: VideoGenerationRequest, task_id: str
             downloaded = await download_videos(video_urls, task_id)
         
         # Step 3: Convert to vertical format
-        log_task(task_id, "Converting to vertical format...")
+        log_task(task_id, "Optimizing video format...")
         converted = await convert_videos_to_vertical(downloaded, task_id)
         
         # Step 4: Compile videos
@@ -1154,8 +1245,8 @@ async def generate_video_with_upload(
     if active_tasks >= MAX_CONCURRENT_TASKS:
         raise HTTPException(503, f"Server busy. Max {MAX_CONCURRENT_TASKS} concurrent tasks allowed.")
     
-    # Validate audio file
-    if not audio_file.filename.endswith(('.mp3', '.wav', '.m4a', '.aac')):
+    # Validate audio file (case-insensitive)
+    if not audio_file.filename.lower().endswith(('.mp3', '.wav', '.m4a', '.aac')):
         raise HTTPException(400, "Audio file must be MP3, WAV, M4A, or AAC format")
     
     task_id = str(uuid.uuid4())
@@ -1223,7 +1314,7 @@ async def generate_video_with_upload(
     
     tasks[task_id] = {
         'status': 'pending',
-        'progress': 'Task created with uploaded audio',
+        'progress': 'Preparing video generation...',
         'error': None,
         'output_file': None,
         'created_at': datetime.now(),
@@ -1231,7 +1322,7 @@ async def generate_video_with_upload(
         'use_uploaded_audio': True,
         'audio_path': str(audio_path),
         'script_text': script_text,
-        'selected_folders': folder_names,
+        'selected_folders': selected_folders,  # Keep the full objects with video IDs
         'video_descriptions': {f.get('name', f): f.get('videos', []) for f in selected_folders if isinstance(f, dict)} if selected_folders else {}
     }
     
@@ -1243,11 +1334,10 @@ async def generate_video_with_upload(
     
     background_tasks.add_task(process_video_generation, request, task_id)
     
-    folder_list = ", ".join(folder_names)
     return VideoGenerationResponse(
         task_id=task_id,
         status="pending",
-        message=f"Video generation started with your audio (using {len(folder_names)} folders: {folder_list})"
+        message="Video generation started with your audio"
     )
 
 @app.get("/task/{task_id}", response_model=TaskStatusResponse)
