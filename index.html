@@ -223,53 +223,15 @@
             margin-top: 5px;
         }
 
-        .switch-mode {
-            text-align: center;
-            margin-bottom: 20px;
-            font-size: 14px;
-            color: #666;
-        }
-
-        .switch-link {
-            color: #667eea;
-            cursor: pointer;
-            text-decoration: underline;
-            font-weight: 600;
-        }
-
-        .mode-ai, .mode-upload {
-            display: none;
-        }
-
-        .mode-ai.active, .mode-upload.active {
-            display: block;
-        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🎬 AI Video Generator</h1>
-        <p class="subtitle">Create stunning vertical videos with captions</p>
+        <p class="subtitle">Upload your audio to create stunning vertical videos</p>
 
-        <div class="switch-mode">
-            <span id="switchText">Want to use your own voice? <span class="switch-link" onclick="toggleMode()">Upload Audio</span></span>
-        </div>
-
-        <!-- AI Mode (ElevenLabs) -->
-        <form id="aiForm" class="mode-ai active">
-            <div class="form-group">
-                <label>📝 Script Text</label>
-                <textarea id="scriptTextAI" placeholder="Enter your video script here..." required></textarea>
-                <div class="note">This will be converted to speech using AI</div>
-            </div>
-
-            <button type="submit" id="generateBtnAI">
-                ✨ Generate Video with AI Voice
-            </button>
-        </form>
-
-        <!-- Upload Mode -->
-        <form id="uploadForm" class="mode-upload">
+        <!-- Upload Mode (Only Mode) -->
+        <form id="uploadForm">
             <div class="form-group">
                 <label>🎤 Upload Your Voiceover</label>
                 <div class="file-upload">
@@ -311,32 +273,12 @@
     </div>
 
     <script>
-        let currentMode = 'ai';
         let currentTaskId = null;
         let statusInterval = null;
         let selectedFolders = [];
         let uploadedAudioFile = null; // Store the uploaded file globally
 
         const API_URL = window.location.origin;
-
-        // Toggle between AI and Upload mode
-        function toggleMode() {
-            currentMode = currentMode === 'ai' ? 'upload' : 'ai';
-            
-            document.querySelectorAll('.mode-ai, .mode-upload').forEach(el => {
-                el.classList.remove('active');
-            });
-            
-            if (currentMode === 'ai') {
-                document.querySelector('.mode-ai').classList.add('active');
-                document.getElementById('switchText').innerHTML = 
-                    'Want to use your own voice? <span class="switch-link" onclick="toggleMode()">Upload Audio</span>';
-            } else {
-                document.querySelector('.mode-upload').classList.add('active');
-                document.getElementById('switchText').innerHTML = 
-                    'Want to use AI voice? <span class="switch-link" onclick="toggleMode()">Use ElevenLabs</span>';
-            }
-        }
 
         // File upload handling with transcription
         document.getElementById('audioFile').addEventListener('change', async function(e) {
@@ -403,18 +345,6 @@
             }
         });
 
-        // AI Form submission
-        document.getElementById('aiForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            
-            const scriptText = document.getElementById('scriptTextAI').value;
-            
-            await generateVideo({
-                script_text: scriptText,
-                search_query: 'technology'  // Default search query
-            }, '/generate-video');
-        });
-
         // Upload Form submission
         document.getElementById('uploadForm').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -437,32 +367,6 @@
             
             await generateVideoWithUpload(formData);
         });
-
-        async function generateVideo(data, endpoint) {
-            try {
-                showStatus('Starting video generation...', 'processing');
-                document.getElementById('generateBtnAI').disabled = true;
-                
-                const response = await fetch(`${API_URL}${endpoint}`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data)
-                });
-                
-                const result = await response.json();
-                
-                if (!response.ok) {
-                    throw new Error(result.detail || 'Failed to start video generation');
-                }
-                
-                currentTaskId = result.task_id;
-                pollStatus();
-                
-            } catch (error) {
-                showStatus(`Error: ${error.message}`, 'error');
-                document.getElementById('generateBtnAI').disabled = false;
-            }
-        }
 
         async function generateVideoWithUpload(formData) {
             try {
@@ -499,12 +403,10 @@
                         clearInterval(statusInterval);
                         showStatus('✅ Video generated successfully! Your video is ready to download.', 'success');
                         document.getElementById('downloadBtn').style.display = 'flex';
-                        document.getElementById('generateBtnAI').disabled = false;
                         document.getElementById('generateBtnUpload').disabled = false;
                     } else if (data.status === 'failed') {
                         clearInterval(statusInterval);
                         showStatus(`❌ Failed: ${data.error}`, 'error');
-                        document.getElementById('generateBtnAI').disabled = false;
                         document.getElementById('generateBtnUpload').disabled = false;
                     } else {
                         // Show detailed progress

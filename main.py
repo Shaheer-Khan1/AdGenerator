@@ -38,12 +38,18 @@ load_dotenv()
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID = os.getenv("VOICE_ID", "KUJ0dDUYhYz8c1Is7Ct6")
-GEMINI_API_KEY = "AIzaSyDYYbbXiakOEOpEH-4hTHZvpZMaoEX3fdk"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_DRIVE_FOLDER_ID = "1l_vWG07Q3tN1UChnlyR40_dZ3McO9NfB"
 
 # Validate required environment variables (make optional for Drive-only mode)
 if not ELEVENLABS_API_KEY:
     print("Warning: ELEVENLABS_API_KEY not set - AI voice will not work")
+
+if not GEMINI_API_KEY:
+    print("Warning: GEMINI_API_KEY not set - AI search query generation will use fallback")
+
+if not PEXELS_API_KEY:
+    print("Warning: PEXELS_API_KEY not set - Video search will not work")
 
 # Memory-optimized settings
 MIN_CLIPS = 2
@@ -431,12 +437,13 @@ Available videos in Google Drive folders (📁 = main folder, 📂 = subfolder):
 {video_list_text}
 
 Task:
-1. Analyze the transcription content and topic
-2. Select 2-3 MOST RELEVANT folders
-3. From each folder, choose 2-3 SPECIFIC videos by their EXACT names (can be from main folder or subfolders)
+1. Analyze the transcription content and topic thoroughly
+2. Select ALL RELEVANT folders (not just 2-3, but as many as match the content)
+3. From each folder, choose 2-4 SPECIFIC videos by their EXACT names (can be from main folder or subfolders)
 4. If a video name contains an actress name (e.g., "sarah", "maria"), note it
-5. If an actress is detected, prioritize videos with the SAME actress name
+5. If an actress is detected, prioritize videos with the SAME actress name across ALL folders
 6. Respond with EXACT video names and IDs
+7. More folders = better variety, so don't limit yourself to just a few
 
 Respond in this EXACT format:
 
@@ -571,7 +578,7 @@ Now analyze and select EXACT videos:"""
             })
         
         result = {
-            'folders': selected_folders[:3],
+            'folders': selected_folders,  # No limit - return all relevant folders
             'actress_name': detected_actress,
             'raw_response': raw_response
         }
@@ -1132,12 +1139,31 @@ async def process_video_generation(request: VideoGenerationRequest, task_id: str
             if isinstance(folder_info, dict) and 'videos' in folder_info:
                 drive_videos.extend(folder_info['videos'])
         
-        if drive_videos and all(v.get('id') for v in drive_videos):
+        # Check if drive videos have REAL IDs (not SAMPLE IDs)
+        has_real_drive_ids = drive_videos and all(
+            v.get('id') and 
+            not v.get('id', '').startswith('SAMPLE_ID') 
+            for v in drive_videos
+        )
+        
+        if has_real_drive_ids:
             # Use Drive videos
-            log_task(task_id, "Preparing video footage...")
+            log_task(task_id, "Using Google Drive videos...")
+            try:
             downloaded = await download_drive_videos(drive_videos, task_id)
+            except Exception as e:
+                log_task(task_id, f"Drive download failed: {e}, falling back to Pexels...")
+                # Fallback to Pexels
+                num_clips = max(MIN_CLIPS, min(MAX_CLIPS, int(duration / 10) + 1))
+                video_urls = await search_pexels_videos(request.search_query, num_clips)
+                downloaded = await download_videos(video_urls, task_id)
         else:
-            # Use Pexels videos
+            # Use Pexels videos (no Drive videos or sample IDs detected)
+            if drive_videos:
+                log_task(task_id, "Sample Drive IDs detected, using Pexels instead...")
+            else:
+                log_task(task_id, "No Drive videos found, using Pexels...")
+            
             num_clips = max(MIN_CLIPS, min(MAX_CLIPS, int(duration / 10) + 1))
             video_urls = await search_pexels_videos(request.search_query, num_clips)
             downloaded = await download_videos(video_urls, task_id)
@@ -1203,33 +1229,7 @@ async def process_video_generation(request: VideoGenerationRequest, task_id: str
 
 # === API ENDPOINTS ===
 
-@app.post("/generate-video", response_model=VideoGenerationResponse)
-async def generate_video(request: VideoGenerationRequest, background_tasks: BackgroundTasks):
-    """Start video generation with ElevenLabs voiceover"""
-    global active_tasks
-    
-    # Limit concurrent tasks to prevent memory overload
-    if active_tasks >= MAX_CONCURRENT_TASKS:
-        raise HTTPException(503, f"Server busy. Max {MAX_CONCURRENT_TASKS} concurrent tasks allowed.")
-    
-    task_id = str(uuid.uuid4())
-    tasks[task_id] = {
-        'status': 'pending',
-        'progress': 'Task created',
-        'error': None,
-        'output_file': None,
-        'created_at': datetime.now(),
-        'completed_at': None,
-        'use_uploaded_audio': False
-    }
-    
-    background_tasks.add_task(process_video_generation, request, task_id)
-    
-    return VideoGenerationResponse(
-        task_id=task_id,
-        status="pending",
-        message="Video generation started"
-    )
+# ElevenLabs endpoint removed - only audio upload is supported
 
 @app.post("/generate-video-upload", response_model=VideoGenerationResponse)
 async def generate_video_with_upload(
@@ -1275,29 +1275,170 @@ async def generate_video_with_upload(
         print(f"Error parsing folders JSON: {e}")
         selected_folders = []
     
-    # Map folder names to Pexels search queries
-    folder_to_search = {
-        "Cellulite": "cellulite treatment beauty",
-        "Glow Coffee": "coffee beauty skin glow",
-        "Hair": "hair care beautiful",
-        "Joints": "joint health wellness",
-        "Menopause": "menopause health women",
-        "Nails": "nail care manicure",
-        "Others": "beauty wellness",
-        "Product": "beauty product cosmetics",
-        "Wrinkles": "anti aging wrinkles skincare"
-    }
+    # Use transcription-based search query for unique video selection
+    if script_text and len(script_text) > 20:
+        # Extract key terms from transcription for unique search
+        import google.generativeai as genai
+        try:
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            
+            # Detect key topics from transcription (works for any language)
+            topics_detected = []
+            french_to_english = {
+                'collagène': 'collagen supplement skin',
+                'peau': 'skin care face',
+                'rides': 'wrinkles anti aging',
+                'cheveux': 'hair care beauty',
+                'ongles': 'nails manicure',
+                'café': 'coffee drink',
+                'cellulite': 'cellulite treatment',
+                'articulations': 'joints health',
+                'ménopause': 'menopause health',
+                'visage': 'face beauty',
+                'crème': 'cream skincare',
+                'vitamine': 'vitamin supplement',
+                'supplément': 'supplement health'
+            }
+            
+            # Check for French keywords and add English equivalents
+            script_lower = script_text.lower()
+            for french, english in french_to_english.items():
+                if french in script_lower:
+                    topics_detected.append(english)
+            
+            # Add folder context to help Gemini understand the theme
+            folder_context = ""
+            if selected_folders:
+                folder_names = [f.get('name', f) if isinstance(f, dict) else f for f in selected_folders[:5]]
+                folder_context = f"\n\nSelected folders (use these themes): {', '.join(folder_names)}"
+                
+                # Add folder-specific visual hints
+                folder_hints = {
+                    'Product': 'product bottles packaging supplements',
+                    'Wrinkles': 'anti aging wrinkles smooth skin face',
+                    'Hair': 'long shiny hair brushing styling',
+                    'Joints': 'joints flexibility movement wellness',
+                    'Nails': 'nails manicure hands beauty',
+                    'Glow Coffee': 'coffee drink morning glowing skin',
+                    'Cellulite': 'cellulite treatment legs smooth',
+                    'Menopause': 'mature woman health wellness'
+                }
+                
+                folder_visual_hints = []
+                for fname in folder_names:
+                    if fname in folder_hints:
+                        folder_visual_hints.append(folder_hints[fname])
+                
+                if folder_visual_hints:
+                    folder_context += f"\nVisual elements to include: {', '.join(folder_visual_hints)}"
+            
+            # Add detected topics to help Gemini understand
+            detected_context = ""
+            if topics_detected:
+                detected_context = f"\n\nDetected topics (use these for context): {', '.join(set(topics_detected[:3]))}"
+            
+            prompt = f"""You are a video search specialist. Analyze this transcription (which may be in any language) and create a HIGHLY SPECIFIC search query IN ENGLISH for finding relevant stock videos on Pexels.
+
+Transcription: "{script_text[:500]}"{detected_context}{folder_context}
+
+IMPORTANT: 
+- The transcription may be in French, English, or other languages
+- You MUST respond with the search query in ENGLISH only
+- Analyze the FULL transcription content, not just keywords
+- The detected topics and folders are HINTS to help you, but analyze the full story/message
+- Extract visual elements, emotions, results, and specific details from the entire transcription
+- Think about what would make compelling stock footage for THIS SPECIFIC content
+
+Your task:
+1. Read and understand the FULL transcription (not just keywords)
+2. Identify ALL visual elements being described (people, products, actions, settings, emotions, results)
+3. Translate key concepts to ENGLISH visual terms
+4. Think about what would look good on camera (close-ups, activities, emotions, results)
+5. Use CONCRETE, VISUAL terms (not abstract concepts)
+6. Be DETAILED and SPECIFIC - include multiple visual elements from the full story
+7. Include WHO is in the video (woman, person, hands, face, body parts, etc.)
+8. Include WHAT action is happening (applying, taking, drinking, showing, comparing)
+9. Include visual RESULTS or emotions (glowing, smooth, shiny, happy, confident, surprised)
+10. Focus on MULTIPLE aspects from the entire narrative to get the most relevant results
+
+Good examples (all in English, detailed):
+- "beautiful woman applying collagen cream on face smooth glowing skin closeup"
+- "woman taking supplement pills vitamin bottle health wellness routine"
+- "close up mature woman face before after wrinkles anti aging treatment"
+- "hands massaging face skincare routine cream application beauty"
+- "woman brushing long shiny healthy hair beauty care routine"
+- "before after skin comparison wrinkles aging smooth radiant results"
+- "woman drinking coffee morning routine glowing skin beauty lifestyle"
+
+Bad examples:
+- "beauty wellness" (too vague, too short)
+- "good product" (not visual, not specific)
+- "woman face" (too generic, needs more detail)
+- "santé beauté" (not in English - must translate to English)
+
+Context clues for translation:
+- If about "collagène" → analyze the full story about collagen testing, results, transformation
+- If about "café" → analyze coffee routine, preparation, benefits story
+- If about "cheveux" → analyze hair care journey, styling, transformation process
+- If about "peau" → analyze skin care routine, application, visible results
+- If about "rides" → analyze anti-aging treatment, before/after, transformation journey
+- If about "supplément/vitamine" → analyze supplement taking routine, health improvements
+
+Now create a DETAILED search query (10-15 words) IN ENGLISH that captures the FULL STORY and focuses on WHAT THE CAMERA WOULD SEE.
+Include WHO, WHAT action, JOURNEY/PROCESS, and VISUAL results from the full transcription:
+
+Search query:"""
+            
+            response = model.generate_content(prompt)
+            primary_query = response.text.strip().strip('"\'')
+            
+            log_info("GEMINI - Generated Search Query", {
+                "Transcription Preview": script_text[:200],
+                "Generated Query": primary_query
+            })
+        except Exception as e:
+            print(f"Error generating search query: {e}")
+            # Improved fallback to simple extraction
+            words = script_text.lower().split()
+            
+            # Remove common words (expanded list)
+            stop_words = {
+                'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 
+                'by', 'from', 'is', 'are', 'was', 'were', 'been', 'be', 'have', 'has', 'had', 
+                'do', 'does', 'did', 'will', 'would', 'could', 'should', 'can', 'may', 'might',
+                'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they',
+                'your', 'our', 'their', 'my', 'his', 'her', 'its', 'what', 'which', 'who',
+                'when', 'where', 'why', 'how', 'all', 'each', 'every', 'some', 'many', 'much',
+                'more', 'most', 'other', 'such', 'only', 'just', 'very', 'too', 'also'
+            }
+            
+            # Look for visual/concrete nouns and action verbs
+            visual_keywords = []
+            for word in words:
+                clean_word = word.strip('.,!?;:')
+                if len(clean_word) > 4 and clean_word not in stop_words:
+                    visual_keywords.append(clean_word)
+            
+            # Take first 8-10 meaningful words for more detail
+            if visual_keywords:
+                primary_query = ' '.join(visual_keywords[:10])
+            else:
+                primary_query = "woman applying beauty skincare cream face closeup routine"
+            
+            log_info("GEMINI - Fallback Query Generated", {
+                "Transcription Preview": script_text[:200],
+                "Fallback Query": primary_query
+            })
+    else:
+        # Fallback if no transcription
+        primary_query = "woman applying beauty skincare product face closeup routine"
     
-    # Combine search queries from multiple folders
+    # Get folder names for logging
     if selected_folders:
         folder_names = [f.get('name', f) if isinstance(f, dict) else f for f in selected_folders[:3]]
-        search_queries = [folder_to_search.get(name, "beauty wellness") for name in folder_names]
-        # Combine queries with "OR" logic - use first folder as primary, others as alternatives
-        primary_query = search_queries[0] if search_queries else "beauty wellness"
-        # For Pexels, we'll use the primary query but log all folders
     else:
         folder_names = ["Others"]
-        primary_query = "beauty wellness"
     
     log_info("VIDEO GENERATION - Starting with Upload", {
         "Task ID": task_id,
@@ -1306,9 +1447,7 @@ async def generate_video_with_upload(
         "Selected Folders": folder_names,
         "Folder Count": len(folder_names),
         "Video Descriptions": {f.get('name', f): f.get('videos', []) for f in selected_folders if isinstance(f, dict)} if selected_folders else {},
-        "Primary Search Query": primary_query,
-        "All Search Queries": search_queries if selected_folders else [primary_query],
-        "Folder Mapping": folder_to_search,
+        "Content-Based Search Query": primary_query,
         "Script Text": script_text[:100] + "..." if len(script_text) > 100 else script_text
     })
     
