@@ -331,6 +331,346 @@ def list_drive_folders_and_files(folder_id: str):
     
     return drive_structure
 
+async def download_and_cache_drive_folder(folder_id: str = None) -> List[dict]:
+    """Download entire Google Drive folder and cache videos locally"""
+    try:
+        import zipfile
+        import shutil
+        from pathlib import Path
+        
+        folder_id = folder_id or GOOGLE_DRIVE_FOLDER_ID
+        cache_dir = Path("drive_cache") / folder_id
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Check if already cached (recursively check all subfolders)
+        cached_videos = list(cache_dir.glob("**/*.mp4")) + list(cache_dir.glob("**/*.mov")) + list(cache_dir.glob("**/*.avi")) + list(cache_dir.glob("**/*.mkv")) + list(cache_dir.glob("**/*.webm"))
+        if cached_videos:
+            log_info("GOOGLE DRIVE - Using Cached Videos", {
+                "Folder ID": folder_id,
+                "Cached Videos": len(cached_videos),
+                "Cache Dir": str(cache_dir)
+            })
+            
+            videos = []
+            for video_path in cached_videos:
+                # Determine folder_name based on path relative to cache_dir
+                relative_path = video_path.relative_to(cache_dir)
+                folder_name_from_path = str(relative_path.parent) if str(relative_path.parent) != '.' else ""
+                
+                videos.append({
+                    'id': video_path.stem,  # Use filename as ID
+                    'name': video_path.name,
+                    'local_path': str(video_path),
+                    'cached': True,
+                    'folder_name': folder_name_from_path  # Store the folder name for filtering
+                })
+            return videos
+        
+        # For folders, we need to use a different approach
+        # Try to download individual files or use gdown library
+        log_info("GOOGLE DRIVE - Downloading Folder", {
+            "Folder ID": folder_id,
+            "Note": "Attempting to download folder contents..."
+        })
+        
+        # Use gdown if available, otherwise try direct download
+        try:
+            import gdown
+            # Download folder - gdown has a 50 file limit
+            folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+            try:
+                # Try with remaining_ok parameter if available (allows partial downloads)
+                try:
+                    gdown.download_folder(folder_url, output=str(cache_dir), quiet=False, use_cookies=False, remaining_ok=True)
+                except TypeError:
+                    # remaining_ok not available, try without it
+                    gdown.download_folder(folder_url, output=str(cache_dir), quiet=False, use_cookies=False)
+            except Exception as e:
+                error_msg = str(e)
+                # If error is about 50 file limit, try downloading subfolders individually
+                if "50 files" in error_msg or "more than 50" in error_msg.lower():
+                    log_info("GOOGLE DRIVE - Folder too large", {
+                        "Note": "Folder has more than 50 files. Attempting to download subfolders individually...",
+                        "Error": error_msg
+                    })
+                    
+                    # Try to extract subfolder IDs from Drive page and download each individually
+                    try:
+                        try:
+                            import requests
+                            from bs4 import BeautifulSoup
+                        except ImportError:
+                            log_info("GOOGLE DRIVE - Missing libraries", {
+                                "Note": "Install requests and beautifulsoup4 for subfolder extraction: pip install requests beautifulsoup4"
+                            })
+                            raise
+                        import re
+                        
+                        # Get the Drive folder page
+                        page_url = f"https://drive.google.com/drive/folders/{folder_id}"
+                        response = requests.get(page_url, timeout=10)
+                        
+                        if response.status_code == 200:
+                            # Try to extract folder IDs from the page
+                            # Google Drive uses data-id attributes or encoded folder IDs in the HTML
+                            soup = BeautifulSoup(response.text, 'html.parser')
+                            
+                            # Look for folder links - they contain the folder ID in the URL
+                            folder_links = soup.find_all('a', href=re.compile(r'/drive/folders/([a-zA-Z0-9_-]+)'))
+                            
+                            subfolder_ids = []
+                            seen_names = set()
+                            
+                            for link in folder_links:
+                                href = link.get('href', '')
+                                match = re.search(r'/drive/folders/([a-zA-Z0-9_-]+)', href)
+                                if match:
+                                    sub_id = match.group(1)
+                                    # Get folder name from link text or aria-label
+                                    folder_name = link.get_text(strip=True) or link.get('aria-label', '') or f"folder_{sub_id}"
+                                    
+                                    # Avoid duplicates and the main folder
+                                    if sub_id != folder_id and sub_id not in [s['id'] for s in subfolder_ids]:
+                                        subfolder_ids.append({'id': sub_id, 'name': folder_name})
+                            
+                            # Download each subfolder
+                            if subfolder_ids:
+                                log_info("GOOGLE DRIVE - Found Subfolders", {
+                                    "Count": len(subfolder_ids),
+                                    "Subfolders": [s['name'] for s in subfolder_ids[:5]]  # Show first 5
+                                })
+                                
+                                for subfolder in subfolder_ids:
+                                    subfolder_cache = cache_dir / subfolder['name']
+                                    subfolder_cache.mkdir(parents=True, exist_ok=True)
+                                    
+                                    try:
+                                        subfolder_url = f"https://drive.google.com/drive/folders/{subfolder['id']}"
+                                        gdown.download_folder(subfolder_url, output=str(subfolder_cache), quiet=True, use_cookies=False)
+                                        log_info("GOOGLE DRIVE - Subfolder Downloaded", {
+                                            "Folder": subfolder['name']
+                                        })
+                                    except Exception as sub_e:
+                                        log_info("GOOGLE DRIVE - Subfolder Download Failed", {
+                                            "Folder": subfolder['name'],
+                                            "Error": str(sub_e)[:100]  # Truncate long errors
+                                        })
+                                        continue
+                            else:
+                                log_info("GOOGLE DRIVE - No Subfolders Found", {
+                                    "Note": "Could not extract subfolder IDs from Drive page"
+                                })
+                        else:
+                            log_info("GOOGLE DRIVE - Could not access Drive page", {
+                                "Status": response.status_code
+                            })
+                    except Exception as scrape_e:
+                        log_info("GOOGLE DRIVE - Subfolder extraction failed", {
+                            "Error": str(scrape_e)[:100],
+                            "Note": "Falling back to error message"
+                        })
+                    
+                    # Check if any files were downloaded
+                    downloaded = list(cache_dir.glob("**/*.mp4")) + list(cache_dir.glob("**/*.mov")) + list(cache_dir.glob("**/*.avi")) + list(cache_dir.glob("**/*.mkv")) + list(cache_dir.glob("**/*.webm"))
+                    if not downloaded:
+                        log_info("GOOGLE DRIVE - No files downloaded", {
+                            "Note": "gdown cannot download folders with more than 50 files. Please organize videos into smaller subfolders (max 50 files each)."
+                        })
+                        return []
+                else:
+                    log_info("GOOGLE DRIVE - Download failed", {
+                        "Error": error_msg,
+                        "Note": "Make sure folder is shared/public"
+                    })
+                    return []
+        except ImportError:
+            # Fallback: try to get file list and download individually
+            log_info("GOOGLE DRIVE - gdown not available", {
+                "Note": "Install gdown: pip install gdown"
+            })
+            return []
+        except Exception as e:
+            log_info("GOOGLE DRIVE - Download failed", {
+                "Error": str(e),
+                "Note": "Make sure folder is shared/public"
+            })
+            return []
+        
+        # Get downloaded videos (recursively)
+        cached_videos = list(cache_dir.glob("**/*.mp4")) + list(cache_dir.glob("**/*.mov")) + list(cache_dir.glob("**/*.avi")) + list(cache_dir.glob("**/*.mkv")) + list(cache_dir.glob("**/*.webm"))
+        
+        videos = []
+        for video_path in cached_videos:
+            # Determine folder_name based on path relative to cache_dir
+            relative_path = video_path.relative_to(cache_dir)
+            folder_name_from_path = str(relative_path.parent) if str(relative_path.parent) != '.' else ""
+            
+            videos.append({
+                'id': video_path.stem,
+                'name': video_path.name,
+                'local_path': str(video_path),
+                'cached': True,
+                'folder_name': folder_name_from_path  # Store the folder name for filtering
+            })
+        
+        log_info("GOOGLE DRIVE - Folder Cached", {
+            "Folder ID": folder_id,
+            "Videos Downloaded": len(videos),
+            "Cache Dir": str(cache_dir)
+        })
+        
+        return videos
+        
+    except Exception as e:
+        log_info("GOOGLE DRIVE - Cache Error", {
+            "Error": str(e),
+            "Note": "Cannot download folder. Make sure folder is shared/public."
+        })
+        return []
+
+async def fetch_videos_from_drive_folder(folder_name: str, folder_id: str = None) -> List[dict]:
+    """Fetch video IDs directly from Google Drive folder by scraping the folder page (no API needed)"""
+    try:
+        import re
+        import asyncio
+        
+        # Get folder ID by searching in main folder
+        if not folder_id:
+            # First, get the main folder page
+            main_folder_url = f"https://drive.google.com/drive/folders/{GOOGLE_DRIVE_FOLDER_ID}"
+            
+            # Fetch the main folder page
+            response = requests.get(main_folder_url, timeout=30)
+            if response.status_code != 200:
+                log_info(f"GOOGLE DRIVE - Cannot access folder", {
+                    "Folder Name": folder_name,
+                    "Main Folder ID": GOOGLE_DRIVE_FOLDER_ID,
+                    "Error": f"HTTP {response.status_code}"
+                })
+                return []
+            
+            # Parse HTML to find folder by name
+            html = response.text
+            
+            # Google Drive stores folder data in window['_DRIVE_ivd'] or similar JSON structures
+            # Look for folder name in the page
+            folder_pattern = rf'"{re.escape(folder_name)}"[^}}]*"id":"([a-zA-Z0-9_-]+)"'
+            matches = re.findall(folder_pattern, html)
+            
+            if not matches:
+                # Try alternative pattern - Google Drive uses different formats
+                # Look for folder links
+                folder_link_pattern = rf'/drive/folders/([a-zA-Z0-9_-]+)[^"]*"[^>]*>{re.escape(folder_name)}'
+                matches = re.findall(folder_link_pattern, html)
+            
+            if not matches:
+                log_info(f"GOOGLE DRIVE - Folder not found in main folder", {
+                    "Folder Name": folder_name,
+                    "Main Folder ID": GOOGLE_DRIVE_FOLDER_ID,
+                    "HTML Preview": html[:500] if len(html) > 500 else html,
+                    "Note": "Cannot find folder in Drive. Make sure folder name matches exactly and folder is accessible."
+                })
+                return []
+            
+            folder_id = matches[0]
+            log_info(f"GOOGLE DRIVE - Found Folder", {
+                "Folder Name": folder_name,
+                "Folder ID": folder_id
+            })
+        
+        # Now fetch videos from the found folder
+        folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+        response = requests.get(folder_url, timeout=30)
+        
+        if response.status_code != 200:
+            log_info(f"GOOGLE DRIVE - Cannot access folder", {
+                "Folder": folder_name,
+                "Folder ID": folder_id,
+                "Error": f"HTTP {response.status_code}"
+            })
+            return []
+        
+        html = response.text
+        all_videos = []
+        
+        # Extract video file IDs and names from the page
+        # Google Drive stores file data in various formats - try multiple patterns
+        
+        # Pattern 1: Look for video file links with IDs (most common)
+        video_pattern = r'/file/d/([a-zA-Z0-9_-]{20,})'
+        video_id_matches = re.findall(video_pattern, html)
+        
+        # Pattern 2: Look for file names near IDs
+        # Try to find video file extensions
+        video_extensions = r'\.(mp4|mov|avi|mkv|webm|wmv|flv|m4v)'
+        video_name_pattern = rf'([^"<>]*{video_extensions})'
+        video_name_matches = re.findall(video_name_pattern, html, re.IGNORECASE)
+        
+        # Pattern 3: Look in script tags for JSON data (Google Drive embeds data here)
+        script_pattern = r'<script[^>]*>(.*?)</script>'
+        scripts = re.findall(script_pattern, html, re.DOTALL)
+        
+        for script in scripts:
+            # Look for file IDs in script content
+            script_ids = re.findall(r'["\']([a-zA-Z0-9_-]{20,})["\']', script)
+            for file_id in script_ids:
+                # Check if there's a video extension nearby
+                context = script[max(0, script.find(file_id)-50):script.find(file_id)+100]
+                if re.search(video_extensions, context, re.IGNORECASE):
+                    # Try to find name
+                    name_match = re.search(rf'["\']([^"\']*{video_extensions})["\']', context, re.IGNORECASE)
+                    video_name = name_match.group(1) if name_match else f"video_{file_id[:8]}.mp4"
+                    all_videos.append({
+                        'id': file_id,
+                        'name': video_name.strip(),
+                        'folder_name': folder_name
+                    })
+        
+        # Add IDs found from pattern 1
+        for video_id in video_id_matches:
+            if video_id not in [v['id'] for v in all_videos]:
+                # Try to find a name for this ID
+                name_context = html[max(0, html.find(video_id)-100):html.find(video_id)+200]
+                name_match = re.search(rf'["\']([^"\']*{video_extensions})["\']', name_context, re.IGNORECASE)
+                video_name = name_match.group(1) if name_match else f"video_{video_id[:8]}.mp4"
+                all_videos.append({
+                    'id': video_id,
+                    'name': video_name.strip(),
+                    'folder_name': folder_name
+                })
+        
+        # Remove duplicates
+        seen_ids = set()
+        unique_videos = []
+        for video in all_videos:
+            if video['id'] not in seen_ids:
+                seen_ids.add(video['id'])
+                unique_videos.append(video)
+        
+        log_info(f"GOOGLE DRIVE - Fetched Videos (No API)", {
+            "Folder": folder_name,
+            "Folder ID": folder_id,
+            "Total Videos Found": len(unique_videos),
+            "HTML Length": len(html),
+            "Source": "Web scraping (no API credentials needed)"
+        })
+        
+        if len(unique_videos) == 0:
+            log_info(f"GOOGLE DRIVE - No Videos Found", {
+                "Folder": folder_name,
+                "Note": "Web scraping may not work if folder requires authentication. Consider making folder public or using Google Drive API."
+            })
+        
+        return unique_videos
+        
+    except Exception as e:
+        log_info(f"GOOGLE DRIVE - Error", {
+            "Folder": folder_name,
+            "Error": str(e),
+            "Note": "Cannot fetch from Drive. Make sure folder is accessible."
+        })
+        return []
+
 def detect_actress_name(video_name: str) -> Optional[str]:
     """Detect actress name from video filename"""
     import re
@@ -352,242 +692,614 @@ def detect_actress_name(video_name: str) -> Optional[str]:
                 return potential_names[0].replace('_', ' ').replace('-', ' ')
     return None
 
-async def get_exact_videos_from_gemini(transcription: str, drive_structure: dict) -> dict:
-    """Use Gemini to select EXACT videos from Drive folders, detecting actress names and prioritizing matching videos"""
+async def fetch_drive_video_ids(folder_id: str, folder_name: str = "") -> List[dict]:
+    """
+    Fetch video IDs from a Google Drive folder by scraping the folder page.
+    Returns list of dicts with 'id' and 'name' keys.
+    """
+    try:
+        import requests
+        import re
+        
+        folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+        
+        log_info(f"GOOGLE DRIVE - Fetching video IDs from folder", {
+            "Folder": folder_name or folder_id,
+            "URL": folder_url
+        })
+        
+        response = requests.get(folder_url, timeout=30)
+        response.raise_for_status()
+        html = response.text
+        
+        all_videos = []
+        
+        # Pattern 1: Look for video file IDs
+        video_pattern = r'/file/d/([a-zA-Z0-9_-]{25,})'
+        video_id_matches = re.findall(video_pattern, html)
+        
+        # Pattern 2: Look for file names with video extensions
+        video_extensions = r'\.(mp4|mov|avi|mkv|webm|wmv|flv|m4v)'
+        video_name_pattern = rf'([^"<>]*{video_extensions})'
+        video_name_matches = re.findall(video_name_pattern, html, re.IGNORECASE)
+        
+        # Pattern 3: Look in script tags for JSON data
+        script_pattern = r'<script[^>]*>(.*?)</script>'
+        scripts = re.findall(script_pattern, html, re.DOTALL)
+        
+        for script in scripts:
+            # Look for file IDs with video extensions nearby
+            script_ids = re.findall(r'["\']([a-zA-Z0-9_-]{25,})["\']', script)
+            for file_id in script_ids:
+                # Check if there's a video extension nearby
+                context = script[max(0, script.find(file_id)-100):script.find(file_id)+200]
+                if re.search(video_extensions, context, re.IGNORECASE):
+                    # Try to find name
+                    name_match = re.search(rf'["\']([^"\']*{video_extensions})["\']', context, re.IGNORECASE)
+                    video_name = name_match.group(1) if name_match else f"video_{file_id[:8]}.mp4"
+                    
+                    # Avoid duplicates
+                    if file_id not in [v['id'] for v in all_videos]:
+                        all_videos.append({
+                            'id': file_id,
+                            'name': video_name.strip(),
+                            'folder_name': folder_name
+                        })
+        
+        # Add IDs from pattern 1
+        for video_id in video_id_matches:
+            if video_id not in [v['id'] for v in all_videos]:
+                # Try to find a name for this ID
+                name_context = html[max(0, html.find(video_id)-200):html.find(video_id)+300]
+                name_match = re.search(rf'["\']([^"\']*{video_extensions})["\']', name_context, re.IGNORECASE)
+                video_name = name_match.group(1) if name_match else f"video_{video_id[:8]}.mp4"
+                all_videos.append({
+                    'id': video_id,
+                    'name': video_name.strip(),
+                    'folder_name': folder_name
+                })
+        
+        log_info(f"GOOGLE DRIVE - Found videos", {
+            "Folder": folder_name or folder_id,
+            "Count": len(all_videos),
+            "Source": "Web scraping"
+        })
+        
+        return all_videos
+        
+    except Exception as e:
+        log_info(f"GOOGLE DRIVE - Error fetching video IDs", {
+            "Folder": folder_name or folder_id,
+            "Error": str(e)
+        })
+        return []
+
+def get_video_duration(video_path: str) -> float:
+    """Get video duration using FFmpeg"""
+    try:
+        exe = ffmpeg.get_ffmpeg_exe()
+        cmd = [exe, "-i", video_path]
+        result = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        
+        match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", result.stderr)
+        if not match:
+            return 5.0  # Default fallback duration
+        
+        h, m, s = map(float, match.groups())
+        return h * 3600 + m * 60 + s
+    except Exception as e:
+        return 5.0  # Default fallback
+
+async def download_specific_videos_from_folder(folder_name: str, num_videos: int = 5, target_duration: float = None) -> List[dict]:
+    """
+    Select videos from already downloaded Drive cache.
+    - Flexible folder matching (handles renamed folders)
+    - Selects videos based on audio duration if provided
+    - Avoids repeating scenes (checks video names/paths for uniqueness)
+    """
+    try:
+        import random
+        from pathlib import Path
+        
+        main_folder_id = GOOGLE_DRIVE_FOLDER_ID
+        cache_base = Path("drive_cache") / main_folder_id
+        
+        # Also check root drive_cache in case structure changed
+        if not cache_base.exists():
+            cache_base = Path("drive_cache")
+        
+        print(f"   🔍 Searching for videos in cache matching '{folder_name}'...")
+        
+        # Find all videos in the cache (recursively)
+        all_videos = (
+            list(cache_base.glob("**/*.mp4")) + 
+            list(cache_base.glob("**/*.mov")) + 
+            list(cache_base.glob("**/*.avi")) + 
+            list(cache_base.glob("**/*.mkv")) + 
+            list(cache_base.glob("**/*.webm"))
+        )
+        
+        print(f"   📊 Found {len(all_videos)} total videos in cache")
+        
+        # Flexible folder matching - check multiple strategies
+        matching_videos = []
+        folder_lower = folder_name.lower()
+        
+        # Strategy 1: Exact match in path
+        for video_path in all_videos:
+            path_str = str(video_path).lower()
+            if folder_lower in path_str:
+                matching_videos.append(video_path)
+        
+        # Strategy 2: Match in parent folder names (if Strategy 1 found nothing)
+        if not matching_videos:
+            for video_path in all_videos:
+                for parent in video_path.parents:
+                    if parent.name and folder_lower in parent.name.lower():
+                        matching_videos.append(video_path)
+                        break
+        
+        # Strategy 3: Partial word matching (e.g., "wrinkle" matches "Wrinkles")
+        if not matching_videos:
+            # Split folder name into words
+            folder_words = folder_lower.split()
+            for video_path in all_videos:
+                path_str = str(video_path).lower()
+                # Check if any word from folder name appears in path
+                if any(word in path_str for word in folder_words if len(word) > 3):
+                    matching_videos.append(video_path)
+        
+        # Remove duplicates
+        matching_videos = list(set(matching_videos))
+        
+        if not matching_videos:
+            log_info(f"GOOGLE DRIVE - No videos found matching {folder_name}", {
+                "Total Videos": len(all_videos),
+                "Cache Path": str(cache_base),
+                "Note": "Folder name might not match cache folder structure"
+            })
+            print(f"   ❌ No videos found for folder '{folder_name}'")
+            
+            # Show available folder names for debugging
+            available_folders = set()
+            for v in all_videos[:50]:  # Check more videos
+                for parent in v.parents:
+                    if parent.name and parent.name != main_folder_id and len(parent.name) > 2:
+                        available_folders.add(parent.name)
+            if available_folders:
+                print(f"   💡 Available folders in cache: {', '.join(sorted(list(available_folders))[:15])}")
+            
+            return []
+        
+        print(f"   ✅ Found {len(matching_videos)} videos matching '{folder_name}'")
+        
+        # Get video durations and filter out duplicates/repeating scenes
+        video_info = []
+        seen_scenes = set()  # Track unique scenes to avoid repeats
+        
+        for video_path in matching_videos:
+            # Extract scene identifier (filename without extension, or base name)
+            scene_id = video_path.stem.lower()
+            
+            # Check for repeating scenes - skip if we've seen similar scene
+            is_duplicate = False
+            for seen in seen_scenes:
+                # Check if scenes are too similar (same base name or very similar)
+                if scene_id == seen or (len(scene_id) > 10 and scene_id[:10] == seen[:10]):
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                try:
+                    duration = get_video_duration(str(video_path))
+                    video_info.append({
+                        'path': video_path,
+                        'duration': duration,
+                        'scene_id': scene_id
+                    })
+                    seen_scenes.add(scene_id)
+                except Exception as e:
+                    # If duration check fails, use default
+                    video_info.append({
+                        'path': video_path,
+                        'duration': 5.0,
+                        'scene_id': scene_id
+                    })
+                    seen_scenes.add(scene_id)
+        
+        if not video_info:
+            print(f"   ⚠️  No unique videos found after filtering duplicates")
+            return []
+        
+        # Select videos based on duration if target_duration is provided
+        if target_duration and target_duration > 0:
+            # Optimized: Select minimum videos needed to cover duration
+            # Each clip will be 2-3 seconds (varied), so we need fewer videos
+            # Average clip duration: 2.5 seconds
+            avg_clip_duration = 2.5
+            clips_needed = int(target_duration / avg_clip_duration) + 1
+            
+            # We'll cycle through videos, so we need fewer videos
+            # Minimum 3 videos for variety, but optimize based on duration
+            videos_needed = max(3, min(clips_needed // 2, len(video_info)))
+            # For longer videos, we can use fewer videos (cycle through them)
+            if target_duration > 15:
+                videos_needed = max(3, min(5, len(video_info)))  # Max 5 videos for longer content
+            
+            num_to_select = min(videos_needed, len(video_info))
+            
+            print(f"   ⏱️  Target duration: {target_duration:.1f}s")
+            print(f"   🎯 Optimized selection: {num_to_select} videos (will cycle with 2-3s clips)")
+            
+            # Select diverse videos (shuffle for randomness)
+            random.shuffle(video_info)
+            selected_info = video_info[:num_to_select]
+            
+            total_duration = sum(v['duration'] for v in selected_info)
+            print(f"   📏 Selected videos total duration: {total_duration:.1f}s")
+        else:
+            # No duration target - just select random videos
+            num_to_select = min(num_videos, len(video_info))
+            selected_info = random.sample(video_info, num_to_select)
+            print(f"   🎲 Randomly selected {num_to_select} videos")
+        
+        # Create video objects
+        videos = []
+        for vid_info in selected_info:
+            video_path = vid_info['path']
+            videos.append({
+                'id': video_path.stem,
+                'name': video_path.name,
+                'local_path': str(video_path),
+                'duration': vid_info['duration'],
+                'cached': True,
+                'folder_name': folder_name
+            })
+            print(f"      📹 {video_path.name} ({vid_info['duration']:.1f}s)")
+        
+        log_info(f"GOOGLE DRIVE - Selected videos from cache", {
+            "Folder": folder_name,
+            "Available": len(matching_videos),
+            "Selected": len(videos),
+            "Total Duration": sum(v.get('duration', 0) for v in videos),
+            "Source": "Existing cache (no download needed)"
+        })
+        
+        return videos
+        
+    except Exception as e:
+        log_info(f"GOOGLE DRIVE - Error selecting videos from cache", {
+            "Folder": folder_name,
+            "Error": str(e)
+        })
+        print(f"   ❌ Error: {str(e)[:100]}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+async def get_exact_videos_from_gemini(transcription: str, drive_structure: dict, audio_duration: float = None) -> dict:
+    """Use Gemini to select relevant FOLDERS, then randomly pick videos from those folders"""
+    
+    def are_semantically_similar(folder_name: str, gemini_response: str) -> bool:
+        """Check if folder name and Gemini response are semantically similar (e.g., Kollagen=Collagen)"""
+        # Common semantic mappings (English/German/variations)
+        semantic_pairs = {
+            'collagen': ['kollagen', 'colágeno'],
+            'hair': ['haar', 'cabello', 'pelo'],
+            'skin': ['haut', 'piel'],
+            'nails': ['nägel', 'nagel', 'uñas'],
+            'joints': ['gelenke', 'articulaciones'],
+            'wrinkles': ['falten', 'arrugas'],
+            'cellulite': ['zellulitis', 'celulitis'],
+            'menopause': ['menopause', 'menopausia', 'wechseljahre'],
+            'glow': ['glanz', 'brillo'],
+            'coffee': ['kaffee', 'café']
+        }
+        
+        folder_lower = folder_name.lower()
+        response_lower = gemini_response.lower()
+        
+        # Check direct match
+        if folder_lower in response_lower or response_lower in folder_lower:
+            return True
+        
+        # Check semantic pairs
+        for english_term, variations in semantic_pairs.items():
+            # If folder contains English term
+            if english_term in folder_lower:
+                # Check if response contains any variation
+                if any(var in response_lower for var in variations):
+                    return True
+            # If folder contains a variation
+            if any(var in folder_lower for var in variations):
+                # Check if response contains English term
+                if english_term in response_lower:
+                    return True
+        
+        return False
+    
     try:
         import google.generativeai as genai
+        import random
         
-        log_info("GEMINI AI - Initializing for Exact Video Selection", {
+        log_info("GEMINI AI - Initializing for Folder Selection", {
             "Model": "gemini-2.5-flash",
-            "Purpose": "Select specific videos from Drive folders, detect actress names"
+            "Purpose": "Select relevant folders based on transcription"
         })
         
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel('gemini-2.5-flash')
         
-        # Build video list for each folder (including subfolders)
-        folders_with_videos = {}
-        all_videos_count = 0
+        # Build folder list - just folder names (videos will be fetched from Drive API)
+        folder_list_text = ""
         
-        for folder_name, folder_data in drive_structure.items():
-            # Get videos directly in folder
-            videos = folder_data.get('videos', [])
-            all_folder_videos = list(videos)  # Copy main folder videos
-            
-            # Get videos from subfolders
-            subfolders = folder_data.get('subfolders', {})
-            for subfolder_name, subfolder_data in subfolders.items():
-                subfolder_videos = subfolder_data.get('videos', [])
-                # Add subfolder videos with path info
-                for v in subfolder_videos:
-                    video_copy = v.copy()
-                    video_copy['subfolder'] = subfolder_name
-                    all_folder_videos.append(video_copy)
-            
-            if all_folder_videos:
-                folders_with_videos[folder_name] = {
-                    'videos': all_folder_videos,
-                    'subfolders': subfolders
-                }
-                all_videos_count += len(all_folder_videos)
+        for folder_name in drive_structure.keys():
+            folder_list_text += f"\n📁 {folder_name}"
         
-        if not folders_with_videos:
-            log_info("GEMINI AI - No Videos Found", {
-                "Note": "No videos in drive_videos.json. Please add video IDs and names.",
-                "Fallback": "Will use Pexels"
+        if not drive_structure:
+            log_info("GEMINI AI - No Folders Found", {
+                "Note": "No folders found in drive_videos.json"
             })
             return {
                 'folders': [{'name': 'Others', 'videos': []}],
+                'product_mentioned': None,
                 'actress_name': None,
-                'raw_response': 'No videos in Drive mapping'
+                'raw_response': 'No folders found'
             }
         
-        # Create prompt with actual video names (including nested structure)
-        # Show ALL videos with clear folder hierarchy
-        video_list_text = ""
-        for folder_name, folder_info in folders_with_videos.items():
-            video_list_text += f"\n📁 FOLDER: {folder_name}\n"
-            videos = folder_info['videos']
-            
-            # Show main folder videos first
-            main_videos = [v for v in videos if 'subfolder' not in v]
-            if main_videos:
-                video_list_text += f"  Main folder videos:\n"
-                for video in main_videos:
-                    video_name = video.get('name', 'unknown')
-                    video_id = video.get('id', '')
-                    video_list_text += f"    • {video_name} (ID: {video_id})\n"
-            
-            # Show subfolder videos with clear hierarchy
-            subfolders = folder_info.get('subfolders', {})
-            for subfolder_name, subfolder_data in subfolders.items():
-                subfolder_videos = subfolder_data.get('videos', [])
-                if subfolder_videos:
-                    video_list_text += f"  📂 SUBFOLDER: {subfolder_name} (inside {folder_name}):\n"
-                    for video in subfolder_videos:
-                        video_name = video.get('name', 'unknown')
-                        video_id = video.get('id', '')
-                        video_list_text += f"    • {video_name} (ID: {video_id})\n"
+        # Calculate approximate timing for transcription
+        words = transcription.split()
+        words_per_second = 2.5  # Average speaking rate
+        estimated_duration = len(words) / words_per_second if audio_duration is None else audio_duration
         
-        prompt = f"""You are analyzing a voiceover transcription to select EXACT videos from Google Drive.
+        prompt = f"""You are analyzing a voiceover transcription to create a TIMELINE that maps specific topics to video folders.
 
 Transcription: "{transcription}"
+Estimated Audio Duration: {estimated_duration:.1f} seconds
 
-Available videos in Google Drive folders (📁 = main folder, 📂 = subfolder):
-{video_list_text}
+Available folders in Google Drive:
+{folder_list_text}
 
-Task:
-1. Analyze the transcription content and topic thoroughly
-2. Select ALL RELEVANT folders (not just 2-3, but as many as match the content)
-3. From each folder, choose 2-4 SPECIFIC videos by their EXACT names (can be from main folder or subfolders)
-4. If a video name contains an actress name (e.g., "sarah", "maria"), note it
-5. If an actress is detected, prioritize videos with the SAME actress name across ALL folders
-6. Respond with EXACT video names and IDs
-7. More folders = better variety, so don't limit yourself to just a few
+CRITICAL INSTRUCTIONS:
+1. **Timeline Analysis**: Analyze the transcription and identify WHEN different topics are mentioned:
+   - Break down the transcription into segments (e.g., 0-4s, 4-8s, etc.)
+   - Identify which folder is most relevant for EACH segment
+   - Example: If transcription says "I have wrinkles" (0-2s) then "try this product" (2-5s), map:
+     * 0-2s → Wrinkles folder
+     * 2-5s → Product folder
+
+2. **Topic-to-Folder Mapping**: Match topics to folders:
+   - "skin", "wrinkles", "face", "haut" → Wrinkles folder
+   - "product", "supplement", "cream", "bottle" → Product folder
+   - "hair", "haar", "cheveux" → Hair folder
+   - "joints", "gelenke", "articulations" → Joints folder
+   - Product names (e.g., "Glow Coffee") → Glow Coffee folder
+   - Match by MEANING, not just exact spelling
+
+3. **Select 2 Primary Folders**: Based on the timeline, select the 2 MOST USED folders:
+   - These are the folders that appear most frequently in the timeline
+   - Quality over quantity - ONLY the top 2 folders
+
+4. **Video Distribution**: Indicate how videos should be distributed:
+   - First folder: How many videos (3-5)
+   - Second folder: How many videos (3-5)
 
 Respond in this EXACT format:
 
+PRODUCT_MENTIONED: [Product/Brand name if mentioned, otherwise "None"]
+
+TIMELINE:
+0-Xs: [FolderName] - [Brief description of what's mentioned]
+Xs-Ys: [FolderName] - [Brief description]
+Ys-Zs: [FolderName] - [Brief description]
+(Continue for all segments)
+
 FOLDER: FolderName1
-VIDEO: exact_video_name.mp4|video_id_1
-VIDEO: another_video_name.mp4|video_id_2
+RELEVANCE: High
+VIDEOS_TO_USE: 5
+TIMELINE_SEGMENTS: [List of time ranges where this folder should be used, e.g., "0-3s, 6-9s"]
 
 FOLDER: FolderName2
-VIDEO: video_name.mp4|video_id_3
+RELEVANCE: Medium
+VIDEOS_TO_USE: 4
+TIMELINE_SEGMENTS: [List of time ranges where this folder should be used, e.g., "3-6s, 9-12s"]
 
-ACTRESS: actress_name (if detected, otherwise "None")
+Example 1 (Product mentioned):
+Transcription: "Entdecken Sie Glow Coffee, das revolutionäre Kollagen für strahlende Haut"
+PRODUCT_MENTIONED: Glow Coffee
 
-Examples:
-If transcription is about coffee and you see videos with "sarah":
 FOLDER: Glow Coffee
-VIDEO: coffee_pour_sarah.mp4|abc123
-VIDEO: pour_closeup.mp4|def456
+RELEVANCE: High
+VIDEOS_TO_USE: 5
+
+FOLDER: Wrinkles (matches "Haut" = "Skin")
+RELEVANCE: Medium
+VIDEOS_TO_USE: 4
+
+Example 2 (Generic topic):
+Transcription: "Bekommen Sie schöne glänzende Haare mit unserem Produkt"
+PRODUCT_MENTIONED: None
+
+FOLDER: Hair (matches "Haare")
+RELEVANCE: High
+VIDEOS_TO_USE: 5
 
 FOLDER: Product
-VIDEO: product_sarah.mp4|ghi789
+RELEVANCE: Medium
+VIDEOS_TO_USE: 3
 
-ACTRESS: sarah
-
-Now analyze and select EXACT videos:"""
+Now analyze and select folders:"""
         
-        log_info("GEMINI AI - Sending Request with Video List", {
+        log_info("GEMINI AI - Sending Folder Selection Request", {
             "Transcription": transcription[:200],
-            "Total Folders with Videos": len(folders_with_videos),
-            "Total Videos Available": all_videos_count,
-            "Prompt Length": len(prompt),
-            "Video List Preview": video_list_text[:500] + "..." if len(video_list_text) > 500 else video_list_text
+            "Total Folders Available": len(drive_structure),
+            "Folder List": folder_list_text
         })
         
         response = model.generate_content(prompt)
         raw_response = response.text.strip()
         
         log_info("GEMINI AI - Received Response", {
-            "Raw Response": raw_response[:500]
+            "Raw Response": raw_response
         })
         
-        # Parse response
-        selected_folders = []
+        # Parse response - extract product name, folder names, timeline, and video counts
+        selected_folder_names = []
+        product_mentioned = None
+        folder_video_counts = {}  # Map folder name to requested video count
+        folder_timeline_segments = {}  # Map folder name to time segments when it should be used
+        
         current_folder = None
-        detected_actress = None
+        timeline_mode = False
         
         for line in raw_response.split('\n'):
             line = line.strip()
-            if line.startswith('FOLDER:'):
+            
+            if line.startswith('PRODUCT_MENTIONED:'):
+                product = line.replace('PRODUCT_MENTIONED:', '').strip()
+                if product.lower() not in ['none', 'n/a', '']:
+                    product_mentioned = product
+                    
+            elif line.startswith('TIMELINE:'):
+                timeline_mode = True
+                continue
+                
+            elif line.startswith('FOLDER:'):
+                timeline_mode = False
                 folder_name = line.replace('FOLDER:', '').strip()
-                # Validate folder name
+                # Validate folder name with semantic matching
                 for valid_folder in drive_structure.keys():
-                    if valid_folder.lower() in folder_name.lower() or folder_name.lower() in valid_folder.lower():
+                    if (valid_folder.lower() in folder_name.lower() or 
+                        folder_name.lower() in valid_folder.lower() or
+                        are_semantically_similar(valid_folder, folder_name)):
+                        if valid_folder not in selected_folder_names:
+                            selected_folder_names.append(valid_folder)
                         current_folder = valid_folder
                         break
-                if current_folder and current_folder not in [f['name'] for f in selected_folders]:
-                    selected_folders.append({
-                        'name': current_folder,
-                        'videos': []
-                    })
-            elif line.startswith('VIDEO:') and current_folder:
-                video_info = line.replace('VIDEO:', '').strip()
-                # Parse "video_name.mp4|video_id" format
-                if '|' in video_info:
-                    video_name, video_id = video_info.split('|', 1)
-                    video_name = video_name.strip()
-                    video_id = video_id.strip()
-                else:
-                    video_name = video_info.strip()
-                    video_id = None
-                
-                if selected_folders:
-                    selected_folders[-1]['videos'].append({
-                        'name': video_name,
-                        'id': video_id
-                    })
-            elif line.startswith('ACTRESS:'):
-                actress_name = line.replace('ACTRESS:', '').strip()
-                if actress_name.lower() != 'none':
-                    detected_actress = actress_name
-        
-        # If actress detected, prioritize matching videos
-        if detected_actress:
-            log_info("GEMINI AI - Actress Detected", {
-                "Actress Name": detected_actress,
-                "Action": "Prioritizing videos with same actress"
-            })
-            
-            # Find all videos with this actress name (including subfolders)
-            for folder_name, folder_data in drive_structure.items():
-                videos = folder_data.get('videos', [])
-                matching_videos = [v for v in videos if detected_actress.lower() in v.get('name', '').lower()]
-                
-                # Also check subfolders
-                subfolders = folder_data.get('subfolders', {})
-                for subfolder_data in subfolders.values():
-                    subfolder_videos = subfolder_data.get('videos', [])
-                    matching_videos.extend([v for v in subfolder_videos if detected_actress.lower() in v.get('name', '').lower()])
-                
-                if matching_videos:
-                    # Add matching videos to selected folders if not already there
-                    folder_found = False
-                    for selected_folder in selected_folders:
-                        if selected_folder['name'] == folder_name:
-                            # Add matching videos that aren't already selected
-                            existing_names = [v['name'] for v in selected_folder['videos']]
-                            for match_video in matching_videos:
-                                if match_video.get('name') not in existing_names:
-                                    selected_folders.append({
-                                        'name': folder_name,
-                                        'videos': [{
-                                            'name': match_video.get('name'),
-                                            'id': match_video.get('id')
-                                        }]
-                                    })
-                            folder_found = True
-                            break
+                        
+            elif line.startswith('VIDEOS_TO_USE:') and current_folder:
+                try:
+                    count = int(line.replace('VIDEOS_TO_USE:', '').strip())
+                    folder_video_counts[current_folder] = count
+                except:
+                    folder_video_counts[current_folder] = 5  # Default
                     
-                    if not folder_found and matching_videos:
-                        selected_folders.append({
-                            'name': folder_name,
-                            'videos': [{
-                                'name': v.get('name'),
-                                'id': v.get('id')
-                            } for v in matching_videos[:3]]
-                        })
+            elif line.startswith('TIMELINE_SEGMENTS:') and current_folder:
+                # Parse timeline segments like "0-3s, 6-9s"
+                segments_str = line.replace('TIMELINE_SEGMENTS:', '').strip()
+                segments = []
+                for seg in segments_str.split(','):
+                    seg = seg.strip()
+                    # Parse "0-3s" or "0-3" format
+                    if '-' in seg and 's' in seg:
+                        try:
+                            start, end = seg.replace('s', '').split('-')
+                            segments.append((float(start.strip()), float(end.strip())))
+                        except:
+                            pass
+                if segments:
+                    folder_timeline_segments[current_folder] = segments
+                    
+            elif timeline_mode and current_folder and ('-' in line or 's' in line.lower()):
+                # Parse timeline entries like "0-4s: Wrinkles - description"
+                if ':' in line:
+                    time_part = line.split(':')[0].strip()
+                    if '-' in time_part and 's' in time_part:
+                        try:
+                            time_part = time_part.replace('s', '').strip()
+                            start, end = time_part.split('-')
+                            start_time = float(start.strip())
+                            end_time = float(end.strip())
+                            # Store this segment for the folder mentioned in the description
+                            desc_part = line.split(':', 1)[1] if ':' in line else ''
+                            for valid_folder in drive_structure.keys():
+                                if valid_folder.lower() in desc_part.lower():
+                                    if valid_folder not in folder_timeline_segments:
+                                        folder_timeline_segments[valid_folder] = []
+                                    folder_timeline_segments[valid_folder].append((start_time, end_time))
+                                    break
+                        except:
+                            pass
         
-        # Ensure we have at least one folder
-        if not selected_folders:
-            selected_folders.append({
-                'name': 'Others',
-                'videos': []
-            })
+        # Limit to 2 folders maximum
+        selected_folder_names = selected_folder_names[:2]
+        
+        # If no folders found, fallback to Others
+        if not selected_folder_names:
+            selected_folder_names = ['Others']
+            folder_video_counts['Others'] = random.randint(3, 5)
+        
+        log_info("GEMINI AI - Folders Selected", {
+            "Product Mentioned": product_mentioned or "None",
+            "Selected Folders": selected_folder_names,
+            "Video Counts Per Folder": folder_video_counts
+        })
+        
+        # Download specific videos from each selected folder (not entire folders)
+        selected_folders = []
+        
+        for folder_name in selected_folder_names:
+            # Get video count for this folder (3-5 videos)
+            num_videos = folder_video_counts.get(folder_name, random.randint(3, 5))
+            num_videos = min(max(3, num_videos), 5)  # Clamp between 3-5
+            
+            print(f"\n📁 FOLDER SELECTED: {folder_name}")
+            if audio_duration:
+                print(f"   Selecting videos based on audio duration ({audio_duration:.1f}s)...\n")
+            else:
+                print(f"   Selecting {num_videos} random videos from this folder...\n")
+            
+            # Download specific videos from this folder
+            # Pass audio duration for duration-based selection
+            folder_videos = await download_specific_videos_from_folder(folder_name, num_videos, audio_duration)
+            
+            if folder_videos:
+                # Get timeline segments for this folder
+                timeline_segments = folder_timeline_segments.get(folder_name, [])
+                
+                selected_folders.append({
+                    'name': folder_name,
+                    'videos': folder_videos,
+                    'timeline_segments': timeline_segments  # Store when to use this folder
+                })
+                
+                print(f"✅ FOLDER: {folder_name}")
+                if timeline_segments:
+                    print(f"   Timeline: {timeline_segments}")
+                print(f"   Selected {len(folder_videos)} videos:")
+                for v in folder_videos:
+                    print(f"   📹 {v.get('name', 'unknown')}")
+                print()
+                
+                log_info(f"FOLDER: {folder_name} - Selected Videos", {
+                    "Selected Count": len(folder_videos),
+                    "Timeline Segments": timeline_segments,
+                    "Selected Videos": [v.get('name', 'unknown') for v in folder_videos],
+                    "Source": "Downloaded from Drive folder"
+                })
+            else:
+                selected_folders.append({
+                    'name': folder_name,
+                    'videos': [],
+                    'timeline_segments': folder_timeline_segments.get(folder_name, [])
+                })
+                print(f"⚠️  FOLDER: {folder_name} - No videos found\n")
+                log_info(f"FOLDER: {folder_name} - No Videos", {
+                    "Note": "Could not download videos from this folder"
+                })
         
         result = {
-            'folders': selected_folders,  # No limit - return all relevant folders
-            'actress_name': detected_actress,
+            'folders': selected_folders,
+            'product_mentioned': product_mentioned,
+            'actress_name': None,
             'raw_response': raw_response
         }
         
         log_info("GEMINI AI - Final Selection", {
+            "Product Mentioned": product_mentioned or "None",
             "Selected Folders": [f['name'] for f in result['folders']],
-            "Selected Videos": {f['name']: [v['name'] for v in f['videos']] for f in result['folders']},
-            "Detected Actress": detected_actress,
-            "Total Videos Selected": sum(len(f['videos']) for f in result['folders'])
+            "Total Videos Selected": sum(len(f['videos']) for f in result['folders']),
+            "Videos Per Folder": {f['name']: len(f['videos']) for f in result['folders']}
         })
         
         return result
@@ -602,8 +1314,6 @@ Now analyze and select EXACT videos:"""
             'actress_name': None,
             'raw_response': f'Error: {str(e)}'
         }
-
-
 # === VIDEO PROCESSING FUNCTIONS ===
 async def search_pexels_videos(query: str, num_clips: int):
     """Fetch video clips from Pexels API"""
@@ -823,86 +1533,150 @@ def get_audio_duration(audio_path: str) -> float:
     h, m, s = map(float, match.groups())
     return h * 3600 + m * 60 + s
 
-async def compile_videos(paths: List[str], target_duration: float, task_id: str):
-    """Compile videos by switching between different videos every 3 seconds"""
+async def compile_videos(paths: List[str], target_duration: float, task_id: str, 
+                        folder_timelines: dict = None, video_to_folder_map: dict = None):
+    """
+    Timeline-aware compilation: Uses videos from appropriate folders based on transcription timeline.
+    If timeline is provided, switches videos when topics change. Otherwise, cycles through videos.
+    """
+    import random
+    
     task_dir = TEMP_DIR / task_id
     output_path = task_dir / "compiled.mp4"
     exe = ffmpeg.get_ffmpeg_exe()
     
-    log_task(task_id, "Creating dynamic video cuts...")
+    # Group videos by folder
+    videos_by_folder = {}
+    if video_to_folder_map:
+        for video_path in paths:
+            folder_name = video_to_folder_map.get(video_path, 'unknown')
+            if folder_name not in videos_by_folder:
+                videos_by_folder[folder_name] = []
+            videos_by_folder[folder_name].append(video_path)
+    else:
+        # Fallback: treat all videos as one group
+        videos_by_folder['unknown'] = paths
     
-    # Simple approach: Just loop the entire sequence of videos until we have enough
-    video_segments = []
-    clip_duration = 3.0
+    use_timeline = folder_timelines and len(folder_timelines) > 0
+    
+    if use_timeline:
+        log_task(task_id, f"Creating timeline-aware compilation ({len(paths)} videos, {target_duration:.1f}s target)...")
+    else:
+        log_task(task_id, f"Creating optimized video compilation ({len(paths)} videos, {target_duration:.1f}s target)...")
+    
+    # Get video durations
+    video_durations = {}
+    video_positions = {}
+    for video_path in paths:
+        try:
+            duration = get_video_duration(video_path)
+            video_durations[video_path] = duration
+            video_positions[video_path] = 0.0
+        except:
+            video_durations[video_path] = 10.0
+            video_positions[video_path] = 0.0
+    
+    list_file = task_dir / "list.txt"
     current_time = 0.0
     segment_idx = 0
     
-    # Create concat list that repeats the video sequence
-    list_file = task_dir / "list.txt"
+    # Clip durations will vary between 2-3 seconds
+    min_clip_duration = 2.0
+    max_clip_duration = 3.0
     
-    # Calculate how many times we need to repeat the full sequence
-    # Each full sequence = len(paths) * 3 seconds
-    sequence_duration = len(paths) * clip_duration
-    full_repeats = int(target_duration / sequence_duration) + 2  # +2 to ensure we have enough
+    # Helper function to get which folder should be used at current time
+    def get_folder_for_time(current_t: float) -> str:
+        if not use_timeline:
+            return None
+        
+        for folder_name, segments in folder_timelines.items():
+            for start, end in segments:
+                if start <= current_t < end:
+                    return folder_name
+        # If no timeline match, return first available folder
+        return list(videos_by_folder.keys())[0] if videos_by_folder else None
+    
+    # Track which video index to use for each folder (for cycling)
+    folder_video_indices = {folder: 0 for folder in videos_by_folder.keys()}
     
     with open(list_file, "w", encoding="utf-8") as f:
-        for repeat in range(full_repeats):
-            for video_idx, video_path in enumerate(paths):
-                # Use different 3-second segments from each video on each repeat
-                start_time = repeat * clip_duration
-                
-                # Create segment
-                segment_output = task_dir / f"segment_{segment_idx}.mp4"
-                
-                cut_cmd = [
-                    exe, "-y",
-                    "-ss", str(start_time),
-                    "-i", video_path,
-                    "-t", str(clip_duration),
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-                    "-r", "30",  # Set framerate to 30fps for consistency
-                    "-an",  # Remove audio
-                    str(segment_output)
-                ]
-                
-                try:
-                    subprocess.run(cut_cmd, check=True, capture_output=True, text=True, timeout=60)
-                    
-                    # Verify segment exists and has reasonable size
-                    if Path(segment_output).exists() and Path(segment_output).stat().st_size > 10000:
-                        abs_path = Path(segment_output).resolve()
-                        path_str = str(abs_path).replace('\\', '/')
-                        f.write(f"file '{path_str}'\n")
-                        segment_idx += 1
-                        current_time += clip_duration
-                        
-                        if segment_idx % len(paths) == 0:  # After each full sequence
-                            log_task(task_id, f"Completed sequence {segment_idx // len(paths)} ({current_time:.1f}s)")
+        while current_time < target_duration:
+            # Determine which folder to use based on timeline
+            if use_timeline:
+                target_folder = get_folder_for_time(current_time)
+                if target_folder and target_folder in videos_by_folder:
+                    available_videos = videos_by_folder[target_folder]
+                    if available_videos:
+                        # Cycle through videos in this folder
+                        video_idx = folder_video_indices[target_folder] % len(available_videos)
+                        video_path = available_videos[video_idx]
+                        folder_video_indices[target_folder] += 1
                     else:
-                        # If segment is too small or doesn't exist, use from beginning
-                        Path(segment_output).unlink(missing_ok=True)
-                        
-                        # Retry from beginning of video
-                        cut_cmd[3] = "0"  # Start from 0
-                        subprocess.run(cut_cmd, check=True, capture_output=True, text=True, timeout=60)
-                        
-                        if Path(segment_output).exists():
-                            abs_path = Path(segment_output).resolve()
-                            path_str = str(abs_path).replace('\\', '/')
-                            f.write(f"file '{path_str}'\n")
-                            segment_idx += 1
-                            current_time += clip_duration
-                        
-                except subprocess.CalledProcessError as e:
-                    print(f"Failed to create segment {segment_idx}: {e.stderr}")
-                    Path(segment_output).unlink(missing_ok=True)
-                    continue
-                
-                # Stop if we have enough
-                if current_time >= target_duration + 3.0:  # Extra buffer
-                    break
+                        # Fallback to any available video
+                        video_path = paths[segment_idx % len(paths)]
+                else:
+                    # Fallback: cycle through all videos
+                    video_path = paths[segment_idx % len(paths)]
+            else:
+                # No timeline: cycle through all videos
+                video_idx = segment_idx % len(paths)
+                video_path = paths[video_idx]
             
-            if current_time >= target_duration + 3.0:
+            video_duration = video_durations.get(video_path, 10.0)
+            current_pos = video_positions.get(video_path, 0.0)
+            
+            # Random clip duration between 2-3 seconds
+            clip_duration = round(random.uniform(min_clip_duration, max_clip_duration), 1)
+            
+            # Check if we have enough video left
+            if current_pos + clip_duration > video_duration:
+                video_positions[video_path] = 0.0
+                current_pos = 0.0
+            
+            # Create segment
+            segment_output = task_dir / f"segment_{segment_idx}.mp4"
+            
+            cut_cmd = [
+                exe, "-y",
+                "-ss", str(current_pos),
+                "-i", video_path,
+                "-t", str(clip_duration),
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                "-r", "30",
+                "-an",
+                str(segment_output)
+            ]
+            
+            try:
+                result = subprocess.run(cut_cmd, check=True, capture_output=True, text=True, timeout=60)
+                
+                if Path(segment_output).exists() and Path(segment_output).stat().st_size > 10000:
+                    abs_path = Path(segment_output).resolve()
+                    path_str = str(abs_path).replace('\\', '/')
+                    f.write(f"file '{path_str}'\n")
+                    
+                    video_positions[video_path] += clip_duration
+                    current_time += clip_duration
+                    segment_idx += 1
+                    
+                    if segment_idx % 5 == 0:
+                        folder_info = f" ({video_to_folder_map.get(video_path, 'unknown')})" if video_to_folder_map else ""
+                        log_task(task_id, f"Created {segment_idx} segments ({current_time:.1f}s / {target_duration:.1f}s){folder_info}")
+                else:
+                    Path(segment_output).unlink(missing_ok=True)
+                    video_positions[video_path] = 0.0
+                    continue
+                    
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to create segment {segment_idx}: {e.stderr[:200]}")
+                Path(segment_output).unlink(missing_ok=True)
+                video_positions[video_path] = 0.0
+                segment_idx += 1
+                if segment_idx >= len(paths) * 10:
+                    break
+                continue
+            
+            if segment_idx > 1000:
                 break
     
     if segment_idx == 0:
@@ -1129,7 +1903,7 @@ async def process_video_generation(request: VideoGenerationRequest, task_id: str
         duration = get_audio_duration(audio_path)
         log_task(task_id, f"Target duration: {duration:.1f}s")
         
-        # Step 2: Fetch and download videos (Drive or Pexels)
+        # Step 2: Fetch and download videos from Google Drive ONLY
         task_data = tasks[task_id]
         selected_folders = task_data.get('selected_folders', [])
         drive_videos = []
@@ -1139,42 +1913,70 @@ async def process_video_generation(request: VideoGenerationRequest, task_id: str
             if isinstance(folder_info, dict) and 'videos' in folder_info:
                 drive_videos.extend(folder_info['videos'])
         
-        # Check if drive videos have REAL IDs (not SAMPLE IDs)
-        has_real_drive_ids = drive_videos and all(
-            v.get('id') and 
-            not v.get('id', '').startswith('SAMPLE_ID') 
-            for v in drive_videos
-        )
+        # Validate Drive videos
+        if not drive_videos:
+            error_msg = "No Drive videos selected. Please ensure folders contain videos in drive_videos.json"
+            log_task(task_id, f"ERROR: {error_msg}")
+            tasks[task_id]['status'] = 'error'
+            tasks[task_id]['error'] = error_msg
+            raise HTTPException(status_code=400, detail=error_msg)
         
-        if has_real_drive_ids:
-            # Use Drive videos
-            log_task(task_id, "Using Google Drive videos...")
-            try:
-            downloaded = await download_drive_videos(drive_videos, task_id)
-            except Exception as e:
-                log_task(task_id, f"Drive download failed: {e}, falling back to Pexels...")
-                # Fallback to Pexels
-                num_clips = max(MIN_CLIPS, min(MAX_CLIPS, int(duration / 10) + 1))
-                video_urls = await search_pexels_videos(request.search_query, num_clips)
-                downloaded = await download_videos(video_urls, task_id)
-        else:
-            # Use Pexels videos (no Drive videos or sample IDs detected)
-            if drive_videos:
-                log_task(task_id, "Sample Drive IDs detected, using Pexels instead...")
-            else:
-                log_task(task_id, "No Drive videos found, using Pexels...")
+        # Use cached videos (already downloaded from Drive folder)
+        log_task(task_id, f"Using {len(drive_videos)} cached videos from Drive folder...")
+        folder_names = set()
+        downloaded = []
+        video_to_folder_map = {}  # Map video path to folder name
+        folder_timelines = {}  # Map folder name to timeline segments
+        
+        # Extract timeline info from folder_info
+        for folder_info in selected_folders:
+            if isinstance(folder_info, dict):
+                folder_name = folder_info.get('name', 'unknown')
+                timeline_segments = folder_info.get('timeline_segments', [])
+                if timeline_segments:
+                    folder_timelines[folder_name] = timeline_segments
+                    log_task(task_id, f"Timeline for {folder_name}: {timeline_segments}")
+        
+        for v in drive_videos:
+            folder_name = v.get('folder_name', 'unknown')
+            folder_names.add(folder_name)
             
-            num_clips = max(MIN_CLIPS, min(MAX_CLIPS, int(duration / 10) + 1))
-            video_urls = await search_pexels_videos(request.search_query, num_clips)
-            downloaded = await download_videos(video_urls, task_id)
+            # Check if video is cached (has local_path)
+            if v.get('cached') and v.get('local_path'):
+                local_path = v.get('local_path')
+                if os.path.exists(local_path):
+                    downloaded.append(local_path)
+                    video_to_folder_map[local_path] = folder_name
+                    log_task(task_id, f"Using cached video: {v.get('name', 'unknown')} ({folder_name})")
+                else:
+                    log_task(task_id, f"Warning: Cached video not found: {local_path}")
+            else:
+                # Fallback: try to download from Drive ID if no cache
+                log_task(task_id, f"Video not cached, attempting download: {v.get('name', 'unknown')}")
+        
+        if not downloaded:
+            error_msg = "No cached videos found. Make sure Drive folder was downloaded successfully."
+            log_task(task_id, f"ERROR: {error_msg}")
+            tasks[task_id]['status'] = 'error'
+            tasks[task_id]['error'] = error_msg
+            raise HTTPException(status_code=400, detail=error_msg)
+        
+        log_task(task_id, f"Selected folders: {', '.join(folder_names)}")
+        log_task(task_id, f"Using {len(downloaded)} cached videos from Drive folder")
         
         # Step 3: Convert to vertical format
         log_task(task_id, "Optimizing video format...")
         converted = await convert_videos_to_vertical(downloaded, task_id)
         
-        # Step 4: Compile videos
-        log_task(task_id, "Compiling videos...")
-        compiled = await compile_videos(converted, duration, task_id)
+        # Update mapping for converted videos
+        converted_to_folder_map = {}
+        for orig_path, converted_path in zip(downloaded, converted):
+            folder_name = video_to_folder_map.get(orig_path, 'unknown')
+            converted_to_folder_map[converted_path] = folder_name
+        
+        # Step 4: Compile videos with timeline support
+        log_task(task_id, "Compiling videos with timeline-aware switching...")
+        compiled = await compile_videos(converted, duration, task_id, folder_timelines, converted_to_folder_map)
 
         # Step 5: Merge audio with video
         log_task(task_id, "Merging audio...")
@@ -1581,11 +2383,15 @@ async def transcribe_audio(audio_file: UploadFile = File(...)):
                 "Detected Language": result.get("language", "unknown")
             })
             
+            # Get audio duration for video selection
+            audio_duration = get_audio_duration(str(audio_path))
+            
             # Get Drive structure (folder names only)
             drive_structure = list_drive_folders_and_files(GOOGLE_DRIVE_FOLDER_ID)
             
             # Analyze with Gemini to select EXACT videos from Drive folders
-            gemini_result = await get_exact_videos_from_gemini(transcription, drive_structure)
+            # Pass audio duration so videos can be selected based on length
+            gemini_result = await get_exact_videos_from_gemini(transcription, drive_structure, audio_duration)
             
             log_info("TRANSCRIPTION - Final Result", {
                 "Success": True,

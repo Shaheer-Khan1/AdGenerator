@@ -24,6 +24,7 @@ wheels/
 # Video directories
 temp_videos/
 output_videos/
+drive_cache/
 
 # Environment variables
 .env

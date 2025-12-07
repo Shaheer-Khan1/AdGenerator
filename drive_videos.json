@@ -1,59 +1,15 @@
 {
   "Glow Coffee": {
-    "videos": [
-      {"id": "SAMPLE_ID_1", "name": "coffee_pour_main.mp4"},
-      {"id": "SAMPLE_ID_2", "name": "coffee_product_main.mp4"}
-    ],
-    "subfolders": {
-      "Coffee Pouring": {
-        "videos": [
-          {"id": "SAMPLE_ID_3", "name": "pour_closeup_1.mp4"},
-          {"id": "SAMPLE_ID_4", "name": "pour_closeup_2.mp4"}
-        ]
-      },
-      "Coffee Drinking": {
-        "videos": [
-          {"id": "SAMPLE_ID_5", "name": "woman_drinking_sarah.mp4"},
-          {"id": "SAMPLE_ID_6", "name": "man_drinking_coffee.mp4"}
-        ]
-      }
-    }
+    "videos": [],
+    "subfolders": {}
   },
   "Hair": {
-    "videos": [
-      {"id": "SAMPLE_ID_7", "name": "hair_main_video.mp4"}
-    ],
-    "subfolders": {
-      "Hair Brushing": {
-        "videos": [
-          {"id": "SAMPLE_ID_8", "name": "brush_smooth_sarah.mp4"},
-          {"id": "SAMPLE_ID_9", "name": "brush_slow_motion.mp4"}
-        ]
-      },
-      "Shiny Hair": {
-        "videos": [
-          {"id": "SAMPLE_ID_10", "name": "shiny_hair_closeup.mp4"}
-        ]
-      }
-    }
+    "videos": [],
+    "subfolders": {}
   },
   "Product": {
-    "videos": [
-      {"id": "SAMPLE_ID_11", "name": "product_showcase.mp4"}
-    ],
-    "subfolders": {
-      "Product Packaging": {
-        "videos": [
-          {"id": "SAMPLE_ID_12", "name": "box_opening.mp4"},
-          {"id": "SAMPLE_ID_13", "name": "package_design.mp4"}
-        ]
-      },
-      "Application": {
-        "videos": [
-          {"id": "SAMPLE_ID_14", "name": "applying_cream.mp4"}
-        ]
-      }
-    }
+    "videos": [],
+    "subfolders": {}
   },
   "Wrinkles": {
     "videos": [],
