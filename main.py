@@ -39,7 +39,9 @@ GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1l_vWG07Q3tN1UChnl
 VIDEO_WIDTH = 720
 VIDEO_HEIGHT = 1280
 MAX_CONCURRENT_TASKS = 2
-CLIP_DURATION = 3.0  # Video changes every 3 seconds
+
+# JSON cache file in root folder
+JSON_CACHE_FILE = Path("drive_cache.json")
 
 # Create directories
 TEMP_DIR = Path("temp_videos")
@@ -47,11 +49,49 @@ OUTPUT_DIR = Path("output_videos")
 TEMP_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+# === GLOBAL WHISPER MODEL (LOAD ONCE) ===
+WHISPER_MODEL = None
+FFMPEG_EXE = None
+
+def load_whisper_model():
+    """Load Whisper model once and keep it in memory"""
+    global WHISPER_MODEL, FFMPEG_EXE
+    
+    if WHISPER_MODEL is None:
+        try:
+            import whisper
+            import imageio_ffmpeg
+            
+            print("🔧 Loading Whisper base model for fast transcription...")
+            
+            # Get FFmpeg executable
+            FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+            print(f"✅ FFmpeg executable: {FFMPEG_EXE}")
+            
+            # Use 'base' model for good balance of speed and accuracy
+            # For even faster: use 'tiny' or 'small'
+            WHISPER_MODEL = whisper.load_model("tiny")
+            
+            print("✅ Whisper base model loaded successfully!")
+            
+        except ImportError as e:
+            print(f"❌ Error loading Whisper: {e}")
+            print("Please install: pip install openai-whisper")
+            raise
+        except Exception as e:
+            print(f"❌ Error loading Whisper model: {e}")
+            raise
+    
+    return WHISPER_MODEL, FFMPEG_EXE
+
+# Load model on startup
+load_whisper_model()
+
 # === FASTAPI APP ===
 app = FastAPI(
     title="AI Video Generator API - Complete Drive Scraper",
     description="Generate videos from audio + ALL footage from Google Drive",
-    version="4.0.0"
+    version="5.2.0"
 )
 
 app.add_middleware(
@@ -72,9 +112,15 @@ def free_memory():
     gc.collect()
     gc.collect()
 
+def log_info(message: str):
+    """Log a message with timestamp to the terminal."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
+
+
 def log_task(task_id: str, message: str):
-    """Log task progress"""
-    print(f"[{task_id}] {message}")
+    """Log task progress with consistent formatting"""
+    log_info(f"[{task_id}] {message}")
     if task_id in tasks:
         tasks[task_id]['progress'] = message
 
@@ -97,22 +143,28 @@ def get_audio_duration(audio_path: str) -> float:
         return 30.0
 
 def get_video_duration(video_path: str) -> float:
-    """Get video duration using FFmpeg"""
+    """Get video duration using FFmpeg - returns default if fails"""
     try:
         import imageio_ffmpeg
         exe = imageio_ffmpeg.get_ffmpeg_exe()
         cmd = [exe, "-i", video_path]
-        result = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        
+        # Add timeout to prevent hanging
+        result = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, 
+                              text=True, timeout=10.0)  # 10 second timeout
         
         match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", result.stderr)
         if not match:
-            return 10.0
+            return 10.0  # Default duration
         
         h, m, s = map(float, match.groups())
         return h * 3600 + m * 60 + s
+    except subprocess.TimeoutExpired:
+        log_error(f"Timeout getting duration for: {video_path}")
+        return 10.0  # Default duration
     except Exception as e:
-        print(f"Error getting video duration: {e}")
-        return 10.0
+        log_error(f"Error getting video duration for {video_path}: {e}")
+        return 10.0  # Default duration
 
 # === ADVANCED DRIVE SCRAPER ===
 class GoogleDriveScraper:
@@ -145,7 +197,6 @@ class GoogleDriveScraper:
         
         try:
             # Method 1: Look for Google Drive's JSON data
-            # Google Drive embeds data in window['_DRIVE_ivd'] or similar
             json_patterns = [
                 r'window\["_DRIVE_ivd"\]\s*=\s*(\{.*?\});',
                 r'var _DRIVE_ivd\s*=\s*(\{.*?\});',
@@ -159,7 +210,6 @@ class GoogleDriveScraper:
                 for match in matches:
                     try:
                         data = json.loads(match)
-                        # Try to extract items from different JSON structures
                         items.update(self._parse_drive_json(data, folder_id))
                     except:
                         pass
@@ -170,7 +220,6 @@ class GoogleDriveScraper:
             # Method 3: Look for data-id attributes
             data_id_matches = re.findall(r'data-id="([a-zA-Z0-9_-]{25,})"', html_content)
             for data_id in data_id_matches:
-                # Check if it's likely a file or folder
                 context = html_content[max(0, html_content.find(data_id)-200):html_content.find(data_id)+200]
                 if '/folders/' in context:
                     items['folders'].append({
@@ -227,7 +276,6 @@ class GoogleDriveScraper:
         
         def extract_from_nested(obj, path=""):
             if isinstance(obj, dict):
-                # Look for folder/file data
                 if 'id' in obj and 'name' in obj:
                     item_id = obj.get('id', '')
                     item_name = obj.get('name', '')
@@ -255,7 +303,6 @@ class GoogleDriveScraper:
                             'mimeType': mime_type
                         })
                 
-                # Recurse through all values
                 for key, value in obj.items():
                     extract_from_nested(value, f"{path}.{key}")
             
@@ -299,17 +346,14 @@ class GoogleDriveScraper:
     
     def _extract_name_from_context(self, context: str, item_id: str) -> str:
         """Extract item name from surrounding HTML context"""
-        # Look for aria-label
         aria_match = re.search(r'aria-label="([^"]+)"', context)
         if aria_match:
             return unquote(aria_match.group(1)).strip()
         
-        # Look for title attribute
         title_match = re.search(r'title="([^"]+)"', context)
         if title_match:
             return unquote(title_match.group(1)).strip()
         
-        # Look for text content
         text_match = re.search(r'>([^<>]{5,100})<', context)
         if text_match:
             return unquote(text_match.group(1)).strip()
@@ -332,13 +376,10 @@ class GoogleDriveScraper:
             response.raise_for_status()
             html_content = response.text
             
-            # Extract items from this folder
             items = self.extract_folder_data(html_content, folder_id)
             
-            # Get folder name
             folder_name = "Root"
             if items.get('folders') or items.get('videos') or items.get('files'):
-                # Try to get folder name from title
                 title_match = re.search(r'<title>([^<]+)</title>', html_content)
                 if title_match:
                     folder_name = unquote(title_match.group(1)).replace(' - Google Drive', '').strip()
@@ -359,7 +400,6 @@ class GoogleDriveScraper:
                 video_id = video.get('id', '')
                 video_name = video.get('name', f"Video_{video_id[:8]}")
                 
-                # Get download URL
                 download_url = f"https://drive.google.com/uc?export=download&id={video_id}"
                 
                 folder_structure['videos'].append({
@@ -394,10 +434,9 @@ class GoogleDriveScraper:
                 subfolder_id = folder.get('id', '')
                 subfolder_name = folder.get('name', f"Folder_{subfolder_id[:8]}")
                 
-                if subfolder_id and subfolder_id != folder_id:  # Avoid infinite recursion
+                if subfolder_id and subfolder_id != folder_id:
                     new_path = f"{current_path}/{subfolder_name}" if current_path else subfolder_name
                     
-                    # Scrape subfolder
                     subfolder_structure = self.scrape_folder(
                         subfolder_id, 
                         new_path, 
@@ -426,10 +465,8 @@ class GoogleDriveScraper:
         videos = []
         
         def extract_videos(node: Dict, current_path: str = ""):
-            # Add videos from this folder
             videos.extend(node.get('videos', []))
             
-            # Process subfolders
             for folder_name, subfolder in node.get('folders', {}).items():
                 new_path = f"{current_path}/{folder_name}" if current_path else folder_name
                 extract_videos(subfolder, new_path)
@@ -449,18 +486,15 @@ class GoogleDriveScraper:
         }
         
         def analyze_node(node: Dict, depth: int = 0):
-            # Update depth count
             if depth not in summary['folders_by_depth']:
                 summary['folders_by_depth'][depth] = 0
             summary['folders_by_depth'][depth] += 1
             
-            # Count videos in this folder
             video_count = len(node.get('videos', []))
             summary['total_videos'] += video_count
             summary['total_files'] += len(node.get('files', []))
             summary['total_folders'] += 1
             
-            # Track video formats
             for video in node.get('videos', []):
                 video_name = video.get('name', '').lower()
                 for ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.wmv', '.flv']:
@@ -470,13 +504,11 @@ class GoogleDriveScraper:
                         summary['video_formats'][ext] += 1
                         break
             
-            # Track subfolders
             for subfolder in node.get('folders', {}).values():
                 analyze_node(subfolder, depth + 1)
         
         analyze_node(structure)
         
-        # Find folders with most videos
         def find_largest_folders(node: Dict, path: str = ""):
             video_count = len(node.get('videos', []))
             if video_count > 0:
@@ -495,190 +527,338 @@ class GoogleDriveScraper:
         summary['largest_folders'].sort(key=lambda x: x['video_count'], reverse=True)
         
         return summary
-
-# === STEP 1: TRANSCRIBE AUDIO ===
-async def transcribe_audio_with_whisper(audio_path: str) -> Tuple[str, float]:
-    """Transcribe audio using Whisper and return transcription + duration"""
-    try:
-        import whisper
-        import imageio_ffmpeg
-        
-        log_task("transcribe", "Loading Whisper model...")
-        
-        # Patch Whisper to use bundled FFmpeg
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        original_run = whisper.audio.run
-        
-        def patched_run(cmd, *args, **kwargs):
-            if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == 'ffmpeg':
-                cmd = [ffmpeg_exe] + cmd[1:]
-            return original_run(cmd, *args, **kwargs)
-        
-        whisper.audio.run = patched_run
-        
-        # Load model (tiny for speed, base for better accuracy)
-        model = whisper.load_model("base")
-        
-        # Transcribe
-        log_task("transcribe", "Transcribing audio...")
-        result = model.transcribe(
-            str(audio_path),
-            fp16=False,
-            language=None
-        )
-        
-        transcription = result["text"].strip()
-        audio_duration = get_audio_duration(audio_path)
-        
-        # Clean up
-        del model
-        whisper.audio.run = original_run
-        free_memory()
-        
-        log_task("transcribe", f"Transcribed {len(transcription)} chars, duration: {audio_duration:.1f}s")
-        return transcription, audio_duration
-        
-    except ImportError:
-        raise Exception("Whisper not installed. Run: pip install openai-whisper")
-    except Exception as e:
-        raise Exception(f"Transcription failed: {str(e)}")
-
-# === STEP 2: COMPLETE DRIVE SCRAPING ===
-def scrape_complete_drive_structure(folder_id: str = None) -> Dict[str, Any]:
-    """Scrape ALL folders and subfolders from Google Drive with unlimited depth"""
-    folder_id = folder_id or GOOGLE_DRIVE_FOLDER_ID
     
-    log_task("drive", f"🚀 Starting complete Drive scraping from folder: {folder_id}")
+    def get_folder_structure_with_video_counts(self, structure: Dict, current_path: str = "") -> List[Dict[str, Any]]:
+        """Get flattened list of all folders with their video counts"""
+        folders = []
+        
+        def extract_folders(node: Dict, path: str = ""):
+            video_count = len(node.get('videos', []))
+            if video_count > 0:
+                folders.append({
+                    'name': node.get('name', 'Unnamed'),
+                    'path': path,
+                    'video_count': video_count,
+                    'full_path': f"{path}/{node.get('name', 'Unnamed')}" if path else node.get('name', 'Unnamed'),
+                    'videos': node.get('videos', [])
+                })
+            
+            for folder_name, subfolder in node.get('folders', {}).items():
+                new_path = f"{path}/{folder_name}" if path else folder_name
+                extract_folders(subfolder, new_path)
+        
+        extract_folders(structure)
+        return folders
+
+def load_cached_drive_data() -> Optional[Dict[str, Any]]:
+    """Load cached drive data from JSON file"""
+    try:
+        if JSON_CACHE_FILE.exists():
+            log_info(f"🔎 Attempting to load drive cache from {JSON_CACHE_FILE.resolve()}")
+            with open(JSON_CACHE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                log_info(f"✅ Loaded cached drive data from {JSON_CACHE_FILE}")
+                log_info(f"   Cache keys: {list(data.keys())}")
+                log_info(f"   Total videos in cache: {data.get('total_videos', 'unknown')}")
+                return data
+        else:
+            log_info("⚠️ No drive cache file found on disk.")
+            return None
+    except Exception as e:
+        log_info(f"⚠️ Error loading cache: {e}")
+    
+    return None
+
+def save_drive_data_to_cache(drive_data: Dict[str, Any]) -> str:
+    """Save drive data to cache JSON file in root folder"""
+    try:
+        log_info(f"💾 Saving drive data to cache at {JSON_CACHE_FILE.resolve()}")
+        # Add cache timestamp
+        drive_data_with_cache = {
+            **drive_data,
+            "cached_at": datetime.now().isoformat(),
+            "cache_version": "1.0"
+        }
+        
+        # Save to JSON file
+        with open(JSON_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(drive_data_with_cache, f, indent=2, ensure_ascii=False, default=str)
+        
+        log_info(f"✅ Drive cache saved to: {JSON_CACHE_FILE}")
+        log_info(f"   Cache size: {JSON_CACHE_FILE.stat().st_size / 1024:.2f} KB")
+        return str(JSON_CACHE_FILE)
+        
+    except Exception as e:
+        log_info(f"❌ Error saving cache: {e}")
+        return ""
+
+def get_drive_data(force_rescan: bool = False) -> Dict[str, Any]:
+    """Get drive data - use cache if available, otherwise scrape"""
+    log_info(f"📥 get_drive_data called (force_rescan={force_rescan})")
+    # Try to load from cache first
+    if not force_rescan:
+        cached_data = load_cached_drive_data()
+        if cached_data:
+            # Check if this is the old format or new format
+            if "folder_structure" in cached_data:
+                # Already has the new format
+                return cached_data
+            elif "root_structure" in cached_data:
+                # Old format, need to process it
+                log_info("ℹ️ Cache in old format detected, rebuilding to new format for generation.")
+                return get_drive_data_for_generation()  # This will process it correctly
+            else:
+                # Unknown format, need to rescan
+                log_info("⚠️ Cache format unknown, falling back to fresh scrape.")
+                pass
+    
+    # If no cache or forced rescan, scrape fresh
+    log_task("drive", f"🚀 Starting fresh Drive scraping from folder: {GOOGLE_DRIVE_FOLDER_ID}")
     log_task("drive", "This may take a while for large folders...")
     
-    scraper = GoogleDriveScraper(folder_id)
+    scraper = GoogleDriveScraper(GOOGLE_DRIVE_FOLDER_ID)
     
-    # Scrape with unlimited depth
-    structure = scraper.scrape_folder(folder_id, max_depth=100)
+    structure = scraper.scrape_folder(GOOGLE_DRIVE_FOLDER_ID, max_depth=100)
     
     if not structure:
         raise Exception("Failed to scrape Drive folder. Make sure it's public and accessible.")
     
-    # Get all videos
     all_videos = scraper.get_all_videos(structure)
-    
-    # Get summary
     summary = scraper.get_folder_summary(structure)
+    folder_structure = scraper.get_folder_structure_with_video_counts(structure)
     
     log_task("drive", f"✅ Drive scraping complete!")
     log_task("drive", f"📊 Summary:")
     log_task("drive", f"  Total folders: {summary['total_folders']}")
-    log_task("drive", f"  Total videos: {summary['total_videos']}")
+    log_task("drive", f"  Total videos: {len(all_videos)}")
     log_task("drive", f"  Total files: {summary['total_files']}")
+    log_task("drive", f"  Folders with videos: {len(folder_structure)}")
+    log_info(f"📁 Folder structure entries: {len(folder_structure)}")
+    log_info(f"🧭 Scrape completed at {datetime.now().isoformat()}")
     
-    for depth, count in summary['folders_by_depth'].items():
-        log_task("drive", f"  Depth {depth}: {count} folders")
-    
-    log_task("drive", f"  Video formats: {summary['video_formats']}")
-    
-    if summary['largest_folders']:
-        log_task("drive", f"  Top 5 folders by video count:")
-        for i, folder in enumerate(summary['largest_folders'][:5], 1):
-            log_task("drive", f"    {i}. {folder['name']}: {folder['video_count']} videos")
-    
-    return {
+    drive_data = {
         "root_structure": structure,
         "all_videos": all_videos,
+        "folder_structure": folder_structure,
         "summary": summary,
         "total_videos": len(all_videos),
-        "scraped_at": datetime.now().isoformat()
+        "scraped_at": datetime.now().isoformat(),
+        "source": "fresh_scrape"
     }
+    
+    # Save to cache
+    save_drive_data_to_cache(drive_data)
+    
+    return drive_data
+# === STEP 1: TRANSCRIBE AUDIO (USING PRE-LOADED WHISPER MODEL) ===
+async def transcribe_audio_with_whisper(audio_path: str) -> Tuple[str, float]:
+    """Transcribe audio using pre-loaded Whisper model (fast!)"""
+    global WHISPER_MODEL, FFMPEG_EXE
+    
+    try:
+        log_task("transcribe", "Transcribing with pre-loaded Whisper base model...")
+        
+        # Ensure model is loaded
+        if WHISPER_MODEL is None:
+            WHISPER_MODEL, FFMPEG_EXE = load_whisper_model()
+        
+        # Patch Whisper's audio module to use bundled FFmpeg
+        import whisper
+        import whisper.audio
+        original_run = whisper.audio.run
+        
+        def patched_run(cmd, *args, **kwargs):
+            """Replace 'ffmpeg' command with full path"""
+            if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == 'ffmpeg':
+                cmd = [FFMPEG_EXE] + cmd[1:]
+            elif isinstance(cmd, str) and cmd == 'ffmpeg':
+                cmd = FFMPEG_EXE
+            return original_run(cmd, *args, **kwargs)
+        
+        # Apply patch
+        whisper.audio.run = patched_run
+        
+        try:
+            # Fast transcription with optimized settings
+            start_time = time.time()
+            result = WHISPER_MODEL.transcribe(
+                str(audio_path),
+                fp16=False,        # Use FP32 for stability
+                language=None,     # Auto-detect language
+                task="transcribe",
+                verbose=False,
+                # Optimize for speed
+                best_of=1,         # Reduce search iterations
+                beam_size=3,       # Smaller beam size for speed
+                temperature=0.0,   # Deterministic output
+                compression_ratio_threshold=2.4,
+                logprob_threshold=-1.0,
+                no_speech_threshold=0.6,
+                condition_on_previous_text=False  # Don't condition on previous text
+            )
+            
+            transcription_time = time.time() - start_time
+            
+            transcription = result["text"].strip()
+            audio_duration = get_audio_duration(audio_path)
+            
+            log_task("transcribe", f"✅ Transcribed {len(transcription)} chars in {transcription_time:.1f}s")
+            log_task("transcribe", f"   Transcription: {transcription[:200]}..." if len(transcription) > 200 else f"   Transcription: {transcription}")
+            log_task("transcribe", f"   Audio duration: {audio_duration:.1f}s")
+            log_task("transcribe", f"   Speed: {audio_duration/transcription_time:.1f}x real-time")
+            
+            return transcription, audio_duration
+        finally:
+            # Restore original run function
+            whisper.audio.run = original_run
+        
+    except Exception as e:
+        import traceback
+        log_task("transcribe", f"❌ Transcription error: {str(e)}")
+        log_task("transcribe", f"   Traceback: {traceback.format_exc()}")
+        raise Exception(f"Transcription failed: {str(e)}")
 
-# === STEP 3: USE GEMINI TO SELECT VIDEOS ===
+# === STEP 2: USE CACHED DRIVE DATA ===
+def get_drive_data_for_generation() -> Dict[str, Any]:
+    """Get drive data for video generation - always use cache if available"""
+    log_task("drive", "Checking for cached drive data...")
+    log_info("🧠 Preparing drive data for generation (cache-first strategy)")
+    
+    # Always try to use cache first for video generation
+    cached_data = load_cached_drive_data()
+    
+    if cached_data:
+        log_task("drive", f"✅ Using cached drive data")
+        log_info(f"   Cache source: {cached_data.get('source', 'unknown')}")
+        log_info(f"   Cached at: {cached_data.get('cached_at', 'unknown')}")
+        
+        # Extract root_structure from cache
+        root_structure = cached_data.get("root_structure")
+        if not root_structure:
+            raise Exception("No root_structure found in cache")
+        
+        # Create a scraper instance to use its methods
+        scraper = GoogleDriveScraper(GOOGLE_DRIVE_FOLDER_ID)
+        
+        # Extract all videos
+        all_videos = scraper.get_all_videos(root_structure)
+        
+        # Get folder structure with video counts
+        folder_structure = scraper.get_folder_structure_with_video_counts(root_structure)
+        
+        # Get summary
+        summary = scraper.get_folder_summary(root_structure)
+        
+        # Build the complete drive data structure
+        drive_data = {
+            "root_structure": root_structure,
+            "all_videos": all_videos,
+            "folder_structure": folder_structure,
+            "summary": summary,
+            "total_videos": len(all_videos),
+            "scraped_at": cached_data.get("scraped_at", "Unknown"),
+            "source": cached_data.get("source", "cache")
+        }
+        
+        log_task("drive", f"📊 Cached Summary:")
+        log_task("drive", f"  Total folders: {summary.get('total_folders', 0)}")
+        log_task("drive", f"  Total videos: {len(all_videos)}")
+        log_task("drive", f"  Folders with videos: {len(folder_structure)}")
+        log_task("drive", f"  Scraped at: {drive_data['scraped_at']}")
+        log_task("drive", f"  Source: {drive_data['source']}")
+        log_info(f"✅ Drive data ready for generation. Videos available: {len(all_videos)}")
+        
+        return drive_data
+    else:
+        log_task("drive", "❌ No cache found. Please scan drive first!")
+        raise Exception("No drive cache found. Please scan the drive first using /scan-drive endpoint.")
+
+# === STEP 3: USE GEMINI TO SELECT FOLDERS AND DISTRIBUTION ===
+# === STEP 3: USE GEMINI TO SELECT FOLDERS AND DISTRIBUTION ===
 async def select_videos_with_gemini(
     transcription: str,
     audio_duration: float,
     drive_data: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Use Gemini to select exact videos based on script timing"""
+    """Use Gemini to decide how many videos to take from each folder based on transcription"""
     try:
-        import google.generativeai as genai
+        log_info("🤖 Starting Gemini folder distribution step...")
+        log_info(f"   Transcription length: {len(transcription)} chars")
+        log_info(f"   Audio duration: {audio_duration:.2f}s")
+        log_info(f"   Drive folders available: {len(drive_data.get('folder_structure', []))}")
+        log_info(f"   Total videos available: {len(drive_data.get('all_videos', []))}")
         
         if not GEMINI_API_KEY:
-            return select_videos_randomly(audio_duration, drive_data)
+            raise Exception("Gemini API key is required. Set GEMINI_API_KEY environment variable.")
+        
+        import google.generativeai as genai
         
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel('gemini-2.5-flash')
         
-        # Prepare video information
-        all_videos = drive_data["all_videos"]
+        folder_structure = drive_data.get("folder_structure", [])
         
-        if not all_videos:
-            raise Exception("No videos found in Drive")
+        if not folder_structure:
+            raise Exception("No folder structure found in drive cache.")
         
-        # Group videos by folder path for better organization
-        videos_by_folder = {}
-        for video in all_videos:
-            folder_path = video.get('folder_path', 'Root')
-            if folder_path not in videos_by_folder:
-                videos_by_folder[folder_path] = []
-            videos_by_folder[folder_path].append(video)
+        # Calculate total clips needed (3 seconds per clip)
+        total_clips_needed = int(math.ceil(audio_duration / 3))
         
-        # Create a sample of videos for Gemini to consider
-        video_samples = []
-        for folder_path, videos in list(videos_by_folder.items())[:10]:  # Limit to 10 folders
-            sample_videos = videos[:3]  # 3 videos per folder
-            for video in sample_videos:
-                video_samples.append({
-                    'id': video['id'],
-                    'name': video['name'],
-                    'folder': folder_path,
-                    'index': len(video_samples)  # Keep track of index
-                })
+        # Sort folders by video count (descending) and limit
+        sorted_folders = sorted(folder_structure, key=lambda x: x['video_count'], reverse=True)[:30]  # Limit to 30 folders
         
-        # Calculate clips needed
-        num_clips_needed = int(math.ceil(audio_duration / CLIP_DURATION))
+        # Create a mapping for quick lookup
+        folder_map = {}
+        for i, folder in enumerate(sorted_folders):
+            folder_map[i + 1] = {
+                'folder_obj': folder,
+                'name': folder['name'],
+                'path': folder['path'],
+                'video_count': folder['video_count'],
+                'videos': folder.get('videos', []),
+                'full_path': folder.get('full_path', '')
+            }
         
-        prompt = f"""You are a professional video editor selecting footage from a massive video library.
+        # Create Gemini prompt
+        prompt = f"""You are a professional video editor planning a video montage.
 
 AUDIO TRANSCRIPT:
-"{transcription}"
+"{transcription[:1000]}"  # Limit transcript length
 
 AUDIO DURATION: {audio_duration:.1f} seconds
-VIDEO REQUIREMENT: Show a different clip every {CLIP_DURATION} seconds
-TOTAL CLIPS NEEDED: {num_clips_needed}
+TOTAL CLIPS NEEDED: {total_clips_needed} (3 seconds each)
 
-VIDEO LIBRARY INFORMATION:
-Total videos available: {len(all_videos)}
-Videos organized in folders by content type.
+FOLDER LIST (sorted by video count):
+{chr(10).join([f"{i}. {folder_map[i]['name']} | Videos: {folder_map[i]['video_count']} | Path: {folder_map[i]['full_path'][:50]}" for i in folder_map])}
 
-SAMPLE VIDEOS (representative of entire library):
-{chr(10).join([f"{i+1}. {v['folder']}/: {v['name'][:50]}..." for i, v in enumerate(video_samples[:20])])}
+YOUR TASK:
+Distribute {total_clips_needed} clips across these folders based on relevance to the transcript.
+Return JSON with exact format:
 
-INSTRUCTIONS:
-1. Analyze the audio transcript carefully
-2. Select videos that visually match the content
-3. Provide variety - different angles, shots, scenes
-4. Consider the folder paths as hints about content type
-5. Each clip will be {CLIP_DURATION} seconds long
-6. You need exactly {num_clips_needed} clips
-
-RESPONSE FORMAT (must be valid JSON):
 {{
-  "selected_videos": [
-    {{
-      "video_index": 0,  // Index in the sample videos list (0-{len(video_samples)-1})
-      "clip_start": 0.0,  // Start time in seconds (0-30)
-      "reason": "Why this video fits the audio"
-    }},
-    // More clips...
+  "folder_distribution": [
+    {{"folder_index": 1, "clips_to_take": 5, "reason": "brief reason"}},
+    {{"folder_index": 2, "clips_to_take": 3, "reason": "brief reason"}}
   ],
-  "total_clips": {num_clips_needed},
-  "selection_strategy": "Brief description of your selection approach"
+  "total_clips": {total_clips_needed}
 }}
 
-IMPORTANT: 
-- video_index must be between 0 and {len(video_samples)-1}
+RULES:
+- Sum of all clips_to_take MUST equal {total_clips_needed}
+- Maximum clips_to_take per folder is its video_count
 - Return ONLY the JSON, no other text"""
 
-        log_task("gemini", f"Selecting {num_clips_needed} clips from {len(all_videos)} videos...")
-        response = model.generate_content(prompt)
-        response_text = response.text.strip()
+        log_task("gemini", f"Asking Gemini to distribute {total_clips_needed} clips across folders...")
+        
+        # Send request to Gemini with timeout
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(model.generate_content, prompt),
+                timeout=60.0  # 60 second timeout
+            )
+            response_text = response.text.strip()
+        except asyncio.TimeoutError:
+            raise Exception("Gemini API timeout after 60 seconds")
         
         # Parse JSON response
         try:
@@ -686,129 +866,155 @@ IMPORTANT:
             start_idx = response_text.find('{')
             end_idx = response_text.rfind('}') + 1
             if start_idx == -1 or end_idx <= start_idx:
-                raise ValueError("No JSON found")
+                raise ValueError("No JSON found in Gemini response")
             
             json_str = response_text[start_idx:end_idx]
             result = json.loads(json_str)
             
-            # Map selected videos to actual video data
+            log_info(f"✅ Successfully parsed Gemini JSON response")
+            
+            # Process folder distribution
+            folder_distribution = result.get("folder_distribution", [])
+            
+            # Validate and normalize distribution
+            total_distributed = 0
+            valid_distributions = []
+            
+            for dist in folder_distribution:
+                folder_idx = dist.get("folder_index", 0)
+                clips_to_take = dist.get("clips_to_take", 0)
+                
+                if folder_idx in folder_map and clips_to_take > 0:
+                    max_possible = folder_map[folder_idx]['video_count']
+                    actual_clips = min(clips_to_take, max_possible)
+                    if actual_clips > 0:
+                        valid_distributions.append({
+                            'folder_idx': folder_idx,
+                            'clips_to_take': actual_clips,
+                            'reason': dist.get('reason', '')
+                        })
+                        total_distributed += actual_clips
+            
+            # Adjust if needed
+            if total_distributed != total_clips_needed:
+                adjustment = total_clips_needed - total_distributed
+                if adjustment > 0 and valid_distributions:
+                    # Add to the first folder
+                    valid_distributions[0]['clips_to_take'] += adjustment
+                    total_distributed += adjustment
+            
+            # Select videos efficiently
             selected_clips = []
-            clip_sequence = []
+            used_video_ids = set()
             
-            for i, selection in enumerate(result.get("selected_videos", [])):
-                video_index = selection.get("video_index", i % len(video_samples))
+            for dist in valid_distributions:
+                folder_idx = dist['folder_idx']
+                clips_to_take = dist['clips_to_take']
                 
-                if 0 <= video_index < len(video_samples):
-                    sample_video = video_samples[video_index]
+                if folder_idx in folder_map:
+                    folder_info = folder_map[folder_idx]
+                    folder_videos = folder_info['videos']
                     
-                    # Find the actual video in the full list
-                    actual_video = None
-                    for video in all_videos:
-                        if video['id'] == sample_video['id']:
-                            actual_video = video
-                            break
+                    # Filter out already used videos
+                    available_videos = [v for v in folder_videos if v.get('id') not in used_video_ids]
                     
-                    if actual_video:
-                        selected_clips.append({
-                            **actual_video,
-                            "clip_start": selection.get("clip_start", random.uniform(0, 10)),
-                            "clip_duration": CLIP_DURATION,
-                            "selection_reason": selection.get("reason", "")
-                        })
+                    if available_videos:
+                        # Take random videos, but limit to available
+                        take_count = min(clips_to_take, len(available_videos))
+                        selected_videos = random.sample(available_videos, take_count)
                         
-                        clip_sequence.append({
-                            "clip_index": i,
-                            "start_time": i * CLIP_DURATION,
-                            "end_time": (i + 1) * CLIP_DURATION
-                        })
+                        for video in selected_videos:
+                            # Use a fixed small clip start (0-5 seconds) to avoid HTTP calls
+                            clip_start = random.uniform(0, 5)
+                            
+                            selected_clips.append({
+                                **video,
+                                "clip_start": clip_start,
+                                "clip_duration": 3.0,
+                                "selection_reason": dist['reason'],
+                                "source_folder": folder_info['full_path'],
+                                "folder_clips_taken": take_count
+                            })
+                            
+                            if video.get('id'):
+                                used_video_ids.add(video['id'])
             
-            # Fill remaining slots if needed
-            while len(selected_clips) < num_clips_needed:
-                random_video = random.choice(all_videos)
-                selected_clips.append({
-                    **random_video,
-                    "clip_start": random.uniform(0, 10),
-                    "clip_duration": CLIP_DURATION,
-                    "selection_reason": "Random selection to fill quota"
-                })
+            # Fill any remaining slots with random videos
+            if len(selected_clips) < total_clips_needed:
+                missing = total_clips_needed - len(selected_clips)
+                all_videos = drive_data.get("all_videos", [])
                 
-                clip_sequence.append({
-                    "clip_index": len(selected_clips) - 1,
-                    "start_time": (len(selected_clips) - 1) * CLIP_DURATION,
-                    "end_time": len(selected_clips) * CLIP_DURATION
-                })
+                # Get videos not already selected
+                available_videos = [v for v in all_videos if v.get('id') not in used_video_ids]
+                
+                for i in range(missing):
+                    if not available_videos:
+                        break
+                    
+                    video = random.choice(available_videos)
+                    clip_start = random.uniform(0, 5)
+                    
+                    selected_clips.append({
+                        **video,
+                        "clip_start": clip_start,
+                        "clip_duration": 3.0,
+                        "selection_reason": "Random selection to fill quota",
+                        "source_folder": "Random selection",
+                        "folder_clips_taken": 1
+                    })
+                    
+                    if video.get('id'):
+                        used_video_ids.add(video['id'])
             
-            # Limit to exactly what we need
-            selected_clips = selected_clips[:num_clips_needed]
-            clip_sequence = clip_sequence[:num_clips_needed]
+            # Shuffle and limit to exact number needed
+            random.shuffle(selected_clips)
+            selected_clips = selected_clips[:total_clips_needed]
+            
+            # Create clip sequence
+            clip_sequence = [
+                {
+                    "clip_index": i,
+                    "start_time": i * 3.0,
+                    "end_time": (i + 1) * 3.0
+                }
+                for i in range(len(selected_clips))
+            ]
+            
+            # Count unique folders used
+            unique_folders = set(clip.get('source_folder', 'Unknown') for clip in selected_clips)
             
             final_result = {
                 "selected_videos": selected_clips,
                 "clip_sequence": clip_sequence,
                 "total_clips": len(selected_clips),
-                "total_duration": len(selected_clips) * CLIP_DURATION,
-                "selection_strategy": result.get("selection_strategy", ""),
-                "gemini_used": True
+                "total_duration": len(selected_clips) * 3.0,
+                "distribution_strategy": result.get("distribution_strategy", "Gemini AI distribution"),
+                "gemini_used": True,
+                "gemini_response_preview": response_text[:200] + "..." if len(response_text) > 200 else response_text,
+                "folders_used": len(unique_folders),
+                "total_folders_available": len(folder_structure)
             }
             
-            log_task("gemini", f"✅ Selected {len(selected_clips)} videos")
+            log_task("gemini", f"✅ Gemini distributed {len(selected_clips)} clips across {len(unique_folders)} folders")
+            
             return final_result
             
         except json.JSONDecodeError as e:
-            log_task("gemini", "Gemini response not valid JSON, using random selection")
-            return select_videos_randomly(audio_duration, drive_data)
+            log_error(f"❌ Failed to parse Gemini JSON response: {e}")
+            log_error(f"Response text: {response_text[:500]}")
+            raise Exception(f"Gemini response not valid JSON: {str(e)}")
         
+    except ImportError:
+        raise Exception("Google Generative AI not installed. Run: pip install google-generativeai")
     except Exception as e:
-        log_task("gemini", f"Gemini failed: {str(e)}, using random selection")
-        return select_videos_randomly(audio_duration, drive_data)
+        log_error(f"❌ Gemini selection failed: {str(e)}")
+        raise Exception(f"Gemini video distribution failed: {str(e)}")
 
-def select_videos_randomly(audio_duration: float, drive_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Fallback random selection"""
-    all_videos = drive_data["all_videos"]
-    
-    if not all_videos:
-        raise Exception("No videos found in Drive")
-    
-    num_clips_needed = int(math.ceil(audio_duration / CLIP_DURATION))
-    
-    # Select random videos
-    selected_videos = random.sample(
-        all_videos, 
-        min(num_clips_needed, len(all_videos))
-    )
-    
-    # Fill remaining slots if needed
-    while len(selected_videos) < num_clips_needed:
-        selected_videos.append(random.choice(all_videos))
-    
-    selected_videos = selected_videos[:num_clips_needed]
-    
-    # Prepare clips
-    selected_clips = []
-    clip_sequence = []
-    
-    for i, video in enumerate(selected_videos):
-        selected_clips.append({
-            **video,
-            "clip_start": random.uniform(0, 10),
-            "clip_duration": CLIP_DURATION,
-            "selection_reason": "Random selection"
-        })
-        
-        clip_sequence.append({
-            "clip_index": i,
-            "start_time": i * CLIP_DURATION,
-            "end_time": (i + 1) * CLIP_DURATION
-        })
-    
-    return {
-        "selected_videos": selected_clips,
-        "clip_sequence": clip_sequence,
-        "total_clips": len(selected_clips),
-        "total_duration": len(selected_clips) * CLIP_DURATION,
-        "selection_strategy": "Random selection (Gemini unavailable)",
-        "gemini_used": False
-    }
+# Add this helper function
+def log_error(message: str):
+    """Log error message"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"❌ [{timestamp}] {message}", file=sys.stderr)
 
 # === STEP 4: DOWNLOAD VIDEOS ===
 async def download_drive_videos_batch(
@@ -821,17 +1027,15 @@ async def download_drive_videos_batch(
     task_dir.mkdir(exist_ok=True)
     
     log_task(task_id, f"Starting parallel download of {len(video_selections)} videos...")
+    log_info(f"⬇️ Download batch initiated (workers={max_workers})")
     
     downloaded_videos = []
-    failed_downloads = []
     
     def download_single_video(video_info: Dict, index: int) -> Optional[Dict]:
-        """Download a single video"""
         video_name = video_info.get("name", f"video_{index}")
         download_url = video_info.get("download_url")
         
         if not download_url:
-            # Try to construct from ID
             file_id = video_info.get("id")
             if file_id and not file_id.startswith("unknown_"):
                 download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
@@ -841,34 +1045,31 @@ async def download_drive_videos_batch(
         output_path = task_dir / f"video_{index:03d}_{Path(video_name).stem}.mp4"
         
         try:
-            # Use session for better performance
+            log_info(f"   [dl-{index}] Preparing download for {video_name} from {download_url}")
             session = requests.Session()
             session.headers.update({
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
             
-            # Download with retries
             for attempt in range(3):
                 try:
+                    log_info(f"   [dl-{index}] Attempt {attempt+1}/3")
                     response = session.get(download_url, stream=True, timeout=30)
                     
-                    # Handle Google Drive confirmation
                     if 'confirm=' in response.url or 'download_warning' in response.url:
-                        # Try to get confirm token
                         for key, value in response.cookies.items():
                             if 'download_warning' in key.lower():
                                 download_url = f"{download_url}&confirm={value}"
                                 response = session.get(download_url, stream=True, timeout=30)
                                 break
                     
-                    # Save file
                     with open(output_path, 'wb') as f:
                         for chunk in response.iter_content(chunk_size=8192):
                             if chunk:
                                 f.write(chunk)
                     
-                    # Verify
                     if output_path.exists() and output_path.stat().st_size > 1024:
+                        log_info(f"   [dl-{index}] ✅ Downloaded {video_name} ({output_path.stat().st_size/1024:.1f} KB)")
                         return {
                             **video_info,
                             "local_path": str(output_path),
@@ -877,38 +1078,33 @@ async def download_drive_videos_batch(
                         }
                     
                 except Exception as e:
-                    if attempt == 2:  # Last attempt
+                    if attempt == 2:
                         raise
+                    log_info(f"   [dl-{index}] Retry due to error: {str(e)[:80]}")
                     time.sleep(1)
             
         except Exception as e:
-            print(f"Download failed for {video_name}: {str(e)[:50]}")
+            log_info(f"   [dl-{index}] ❌ Download failed for {video_name}: {str(e)[:80]}")
             if output_path.exists():
                 output_path.unlink()
             return None
     
-    # Download in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
         for i, video_info in enumerate(video_selections):
             futures.append(executor.submit(download_single_video, video_info, i))
         
-        # Collect results
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             result = future.result()
             if result:
                 downloaded_videos.append(result)
                 if len(downloaded_videos) % 5 == 0:
                     log_task(task_id, f"  Downloaded {len(downloaded_videos)}/{len(video_selections)} videos")
-            else:
-                failed_downloads.append(i)
     
     if not downloaded_videos:
-        raise Exception(f"Failed to download any videos. {len(failed_downloads)} failed")
+        raise Exception(f"Failed to download any videos")
     
     log_task(task_id, f"✅ Downloaded {len(downloaded_videos)}/{len(video_selections)} videos")
-    if failed_downloads:
-        log_task(task_id, f"  Failed downloads: {len(failed_downloads)} videos")
     
     return downloaded_videos
 
@@ -929,31 +1125,32 @@ def create_video_clips_parallel(
         clips_dir.mkdir(exist_ok=True)
         
         log_task(task_id, f"Creating {len(clip_sequence)} clips in parallel...")
+        log_info(f"🎬 Clip creation started (workers={max_workers})")
         
         def create_single_clip(clip_info: Dict, index: int) -> Optional[str]:
-            """Create a single 3-second clip"""
             clip_index = clip_info.get("clip_index", index)
             
             if clip_index >= len(downloaded_videos):
+                log_info(f"   [clip-{index}] Skipped - missing video at index {clip_index}")
                 return None
             
             video_info = downloaded_videos[clip_index]
             video_path = video_info.get("local_path")
             
             if not video_path or not Path(video_path).exists():
+                log_info(f"   [clip-{index}] Skipped - video path missing")
                 return None
             
             clip_output = clips_dir / f"clip_{index:03d}.mp4"
             
-            # Use clip_start from selection or random point
             video_start_time = video_info.get("clip_start", random.uniform(0, 10))
+            log_info(f"   [clip-{index}] Creating 3s clip from {video_path} starting at {video_start_time:.2f}s")
             
-            # Create clip command
             cmd = [
                 exe, "-y",
                 "-ss", str(video_start_time),
                 "-i", video_path,
-                "-t", str(CLIP_DURATION),
+                "-t", "3.0",  # Fixed 3-second clips
                 "-vf", f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,crop={VIDEO_WIDTH}:{VIDEO_HEIGHT}",
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
@@ -964,27 +1161,28 @@ def create_video_clips_parallel(
             ]
             
             try:
-                # Run FFmpeg
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
                 
                 if clip_output.exists() and clip_output.stat().st_size > 10000:
+                    log_info(f"   [clip-{index}] ✅ Clip created ({clip_output.stat().st_size/1024:.1f} KB)")
                     return str(clip_output)
                 else:
+                    log_info(f"   [clip-{index}] ❌ Clip output missing or too small")
                     return None
                     
             except subprocess.TimeoutExpired:
+                log_info(f"   [clip-{index}] ❌ Timeout during ffmpeg")
                 return None
             except Exception:
+                log_info(f"   [clip-{index}] ❌ Unexpected error during clip creation")
                 return None
         
-        # Create clips in parallel
         clip_paths = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for i, clip_info in enumerate(clip_sequence):
                 futures.append(executor.submit(create_single_clip, clip_info, i))
             
-            # Collect results
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
                 result = future.result()
                 if result:
@@ -1015,14 +1213,19 @@ def merge_clips_with_audio(
         task_dir = TEMP_DIR / task_id
         output_path = OUTPUT_DIR / f"{task_id}_final.mp4"
         
-        # Create concatenation list
+        log_info(f"🔗 Merging {len(clip_paths)} clips with audio for task {task_id}")
+        log_info(f"   Audio path: {audio_path}")
+        log_info(f"   Output path: {output_path}")
+        
+        if not clip_paths:
+            raise Exception("No clips to merge")
+        
         concat_list = task_dir / "concat_list.txt"
         with open(concat_list, "w", encoding="utf-8") as f:
             for clip_path in clip_paths:
                 abs_path = Path(clip_path).resolve()
                 f.write(f"file '{abs_path}'\n")
         
-        # Concatenate clips
         temp_video = task_dir / "concatenated.mp4"
         
         concat_cmd = [
@@ -1039,10 +1242,11 @@ def merge_clips_with_audio(
         ]
         
         log_task(task_id, "Concatenating clips...")
+        log_info(f"   Running ffmpeg concat with list file at {concat_list}")
         subprocess.run(concat_cmd, check=True, capture_output=True, text=True, timeout=300)
         
-        # Add audio
         log_task(task_id, "Adding audio track...")
+        log_info("   Combining concatenated video with audio track (aac 192k)")
         
         merge_cmd = [
             exe, "-y",
@@ -1060,10 +1264,10 @@ def merge_clips_with_audio(
         if not output_path.exists():
             raise Exception("Final video not created")
         
-        # Get final duration
         final_duration = get_video_duration(str(output_path))
         
         log_task(task_id, f"✅ Final video created: {output_path} ({final_duration:.1f}s)")
+        log_info(f"🎉 Final video ready at {output_path} duration {final_duration:.1f}s")
         return str(output_path)
         
     except Exception as e:
@@ -1074,44 +1278,55 @@ async def process_video_generation_pipeline(
     audio_path: str,
     task_id: str
 ):
-    """Main pipeline: Transcribe → Scrape ALL Drive → Select videos → Download → Create clips → Merge"""
+    """Main pipeline: Fast transcription → Use cached Drive data → Gemini distributes clips → Select random videos → Download → Create clips → Merge"""
     global active_tasks
     
     try:
+        log_info(f"🚦 Starting pipeline for task {task_id}")
+        start_pipeline = time.time()
         active_tasks += 1
         tasks[task_id]['status'] = 'processing'
         
-        # STEP 1: Transcribe audio
-        log_task(task_id, "Step 1/6: Transcribing audio with Whisper...")
+        # STEP 1: Fast transcription with pre-loaded Whisper
+        log_task(task_id, "Step 1/6: Fast transcription with pre-loaded Whisper...")
+        step_start = time.time()
         transcription, audio_duration = await transcribe_audio_with_whisper(audio_path)
         tasks[task_id]['transcription'] = transcription
         tasks[task_id]['audio_duration'] = audio_duration
+        log_info(f"📝 Step 1 done in {time.time() - step_start:.2f}s (duration={audio_duration:.2f}s)")
         
-        # STEP 2: Scrape COMPLETE Google Drive structure
-        log_task(task_id, "Step 2/6: Scraping ALL folders and subfolders from Drive...")
-        drive_data = scrape_complete_drive_structure(GOOGLE_DRIVE_FOLDER_ID)
+        # STEP 2: Get drive data from cache
+        log_task(task_id, "Step 2/6: Loading drive data from cache...")
+        step_start = time.time()
+        drive_data = get_drive_data_for_generation()
         tasks[task_id]['drive_data'] = drive_data
+        log_info(f"📂 Step 2 done in {time.time() - step_start:.2f}s (folders={len(drive_data.get('folder_structure', []))}, videos={len(drive_data.get('all_videos', []))})")
         
-        # STEP 3: Use Gemini to select videos
-        log_task(task_id, "Step 3/6: Selecting videos with Gemini...")
+        # STEP 3: Use Gemini to distribute clips across folders
+        log_task(task_id, "Step 3/6: Gemini distributing clips across folders...")
+        step_start = time.time()
         selection_result = await select_videos_with_gemini(
             transcription, 
             audio_duration, 
             drive_data
         )
         tasks[task_id]['selection_result'] = selection_result
+        log_info(f"🤖 Step 3 done in {time.time() - step_start:.2f}s (clips={selection_result.get('total_clips')})")
         
         # STEP 4: Download selected videos in parallel
         log_task(task_id, "Step 4/6: Downloading videos in parallel...")
+        step_start = time.time()
         downloaded_videos = await download_drive_videos_batch(
             selection_result["selected_videos"],
             task_id,
             max_workers=5
         )
         tasks[task_id]['downloaded_videos'] = downloaded_videos
+        log_info(f"⬇️ Step 4 done in {time.time() - step_start:.2f}s (downloaded={len(downloaded_videos)})")
         
         # STEP 5: Create video clips in parallel
         log_task(task_id, "Step 5/6: Creating 3-second clips in parallel...")
+        step_start = time.time()
         clip_paths = create_video_clips_parallel(
             downloaded_videos,
             selection_result["clip_sequence"],
@@ -1119,23 +1334,24 @@ async def process_video_generation_pipeline(
             max_workers=4
         )
         tasks[task_id]['clip_paths'] = clip_paths
+        log_info(f"✂️ Step 5 done in {time.time() - step_start:.2f}s (clips={len(clip_paths)})")
         
         # STEP 6: Merge clips and add audio
         log_task(task_id, "Step 6/6: Merging clips with audio...")
+        step_start = time.time()
         final_video_path = merge_clips_with_audio(
             clip_paths,
             audio_path,
             task_id
         )
         
-        # Update task status
         tasks[task_id]['status'] = 'completed'
         tasks[task_id]['output_file'] = final_video_path
         tasks[task_id]['completed_at'] = datetime.now()
         
         log_task(task_id, "✅ Video generation completed successfully!")
+        log_info(f"🏁 Pipeline finished in {time.time() - start_pipeline:.2f}s for task {task_id}")
         
-        # Cleanup temp files (keep final video)
         try:
             task_dir = TEMP_DIR / task_id
             shutil.rmtree(task_dir, ignore_errors=True)
@@ -1150,7 +1366,6 @@ async def process_video_generation_pipeline(
         tasks[task_id]['completed_at'] = datetime.now()
         log_task(task_id, f"❌ Failed: {e}")
         
-        # Cleanup on error
         try:
             task_dir = TEMP_DIR / task_id
             shutil.rmtree(task_dir, ignore_errors=True)
@@ -1171,31 +1386,31 @@ async def generate_video(
     """Main endpoint to generate video from audio"""
     global active_tasks
     
+    log_info(f"🌐 /generate-video called with file {audio_file.filename}")
     if active_tasks >= MAX_CONCURRENT_TASKS:
         raise HTTPException(429, f"Server busy. Max {MAX_CONCURRENT_TASKS} concurrent tasks allowed.")
     
-    # Validate file
     if not audio_file.filename.lower().endswith(('.mp3', '.wav', '.m4a', '.aac', '.mp4', '.mov')):
         raise HTTPException(400, "Supported formats: MP3, WAV, M4A, AAC, MP4, MOV")
     
-    # Create task
     task_id = str(uuid.uuid4())
     task_dir = TEMP_DIR / task_id
     task_dir.mkdir(exist_ok=True)
     
-    # Save uploaded file
     audio_path = task_dir / "audio.mp3"
     try:
+        log_info(f"📝 Saving uploaded audio to {audio_path}")
         with open(audio_path, "wb") as f:
             content = await audio_file.read()
             f.write(content)
+        log_info(f"📦 Audio saved ({audio_path.stat().st_size/1024:.1f} KB)")
     except Exception as e:
+        log_info(f"❌ Failed to save uploaded audio: {e}")
         raise HTTPException(500, f"Failed to save audio file: {str(e)}")
     
-    # Initialize task
     tasks[task_id] = {
         'status': 'pending',
-        'progress': 'Starting complete video generation...',
+        'progress': 'Starting video generation...',
         'error': None,
         'output_file': None,
         'created_at': datetime.now(),
@@ -1208,20 +1423,20 @@ async def generate_video(
         'clip_paths': None
     }
     
-    # Start background processing
     background_tasks.add_task(process_video_generation_pipeline, str(audio_path), task_id)
     
     return JSONResponse({
         "task_id": task_id,
         "status": "pending",
-        "message": "Video generation started with complete Drive scanning",
+        "message": "Video generation started",
         "created_at": tasks[task_id]['created_at'].isoformat(),
-        "note": "This may take a while as we scan ALL folders and subfolders"
+        "note": "Using pre-loaded Whisper model for fast transcription"
     })
 
 @app.get("/task/{task_id}")
 async def get_task_status(task_id: str):
     """Get task status"""
+    log_info(f"ℹ️ /task/{task_id} requested")
     if task_id not in tasks:
         raise HTTPException(404, "Task not found")
     
@@ -1244,26 +1459,30 @@ async def get_task_status(task_id: str):
         response["output_file"] = task['output_file']
         response["download_url"] = f"/download/{task_id}"
     
-    # Include processing info
     if task['transcription']:
         response["transcription"] = task['transcription'][:200] + "..." if len(task['transcription']) > 200 else task['transcription']
     
     if task['audio_duration']:
         response["audio_duration"] = task['audio_duration']
+        response["clips_needed"] = int(math.ceil(task['audio_duration'] / 3))
     
     if task['drive_data']:
         response["total_videos_found"] = task['drive_data'].get('total_videos', 0)
         response["total_folders"] = task['drive_data'].get('summary', {}).get('total_folders', 0)
+        response["folders_with_videos"] = len(task['drive_data'].get('folder_structure', []))
     
     if task['selection_result']:
         response["clips_selected"] = task['selection_result'].get('total_clips', 0)
-        response["selection_strategy"] = task['selection_result'].get('selection_strategy', '')
+        response["distribution_strategy"] = task['selection_result'].get('distribution_strategy', '')
+        response["folders_used"] = task['selection_result'].get('folders_used', 0)
+        response["gemini_used"] = task['selection_result'].get('gemini_used', False)
     
     return JSONResponse(response)
 
 @app.get("/download/{task_id}")
 async def download_video(task_id: str):
     """Download generated video"""
+    log_info(f"⬇️ /download/{task_id} requested")
     if task_id not in tasks:
         raise HTTPException(404, "Task not found")
     
@@ -1283,30 +1502,27 @@ async def download_video(task_id: str):
 
 @app.get("/scan-drive")
 async def scan_drive_endpoint():
-    """Scan Drive without generating video"""
+    """Scan Drive and update cache"""
     try:
         log_task("scan", "Starting Drive scan...")
-        drive_data = scrape_complete_drive_structure(GOOGLE_DRIVE_FOLDER_ID)
+        log_info("🔍 /scan-drive called - forcing fresh scrape")
+        drive_data = get_drive_data(force_rescan=True)
         
-        # Format response
         summary = drive_data['summary']
+        folder_structure = drive_data.get('folder_structure', [])
         
         return JSONResponse({
             "success": True,
+            "message": "Drive scan completed and cache updated",
             "total_videos": drive_data['total_videos'],
             "total_folders": summary['total_folders'],
             "total_files": summary['total_files'],
+            "folders_with_videos": len(folder_structure),
             "folders_by_depth": summary['folders_by_depth'],
             "video_formats": summary['video_formats'],
             "largest_folders": summary['largest_folders'][:10],
-            "sample_videos": [
-                {
-                    "name": v['name'],
-                    "folder": v.get('folder_path', 'Root'),
-                    "download_url": v.get('download_url', '')
-                }
-                for v in drive_data['all_videos'][:5]
-            ],
+            "cache_file": str(JSON_CACHE_FILE),
+            "cache_size": JSON_CACHE_FILE.stat().st_size if JSON_CACHE_FILE.exists() else 0,
             "scraped_at": drive_data['scraped_at']
         })
         
@@ -1317,23 +1533,65 @@ async def scan_drive_endpoint():
             "note": "Make sure your Google Drive folder is set to 'Anyone with the link can view'"
         })
 
+@app.get("/cache-status")
+async def cache_status():
+    """Check cache status"""
+    log_info("🗄️ /cache-status requested")
+    if JSON_CACHE_FILE.exists():
+        try:
+            with open(JSON_CACHE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            cache_time = data.get('cached_at', 'Unknown')
+            total_videos = data.get('total_videos', 0)
+            folder_structure = data.get('folder_structure', [])
+            
+            return JSONResponse({
+                "success": True,
+                "cache_exists": True,
+                "cache_file": str(JSON_CACHE_FILE),
+                "cache_size": JSON_CACHE_FILE.stat().st_size,
+                "total_videos": total_videos,
+                "folders_with_videos": len(folder_structure),
+                "cached_at": cache_time,
+                "can_generate_videos": total_videos > 0
+            })
+        except Exception as e:
+            return JSONResponse({
+                "success": False,
+                "error": f"Cache corrupted: {str(e)}"
+            })
+    else:
+        return JSONResponse({
+            "success": False,
+            "cache_exists": False,
+            "message": "No cache found. Please scan drive first."
+        })
+
 @app.get("/api/status")
 async def api_status():
     """API status endpoint"""
+    log_info("📡 /api/status requested")
+    cache_exists = JSON_CACHE_FILE.exists()
+    cache_size = JSON_CACHE_FILE.stat().st_size if cache_exists else 0
+    
     return JSONResponse({
         "status": "running",
-        "version": "4.0.0-complete-scraper",
+        "version": "5.2.0-fast-whisper",
         "active_tasks": active_tasks,
         "max_concurrent_tasks": MAX_CONCURRENT_TASKS,
         "total_tasks": len(tasks),
+        "cache_exists": cache_exists,
+        "cache_size": cache_size,
+        "whisper_loaded": WHISPER_MODEL is not None,
         "drive_access": "public (complete scanning)",
         "features": [
-            "Complete Google Drive scanning (ALL folders)",
-            "Unlimited depth scraping",
-            "Parallel downloading",
-            "Parallel clip creation",
-            "Gemini AI video selection",
-            "3-second clip switching"
+            "Whisper base model pre-loaded (fast transcription)",
+            "Cache-based folder structure (no expiration)",
+            "Gemini AI for folder distribution only",
+            "Random video selection from chosen folders",
+            "3-second clips based on audio duration",
+            "Manual cache update via /scan-drive"
         ]
     })
 
@@ -1345,7 +1603,7 @@ async def root():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>🎬 Complete AI Video Generator</title>
+        <title>🎬 AI Video Generator</title>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
@@ -1378,8 +1636,31 @@ async def root():
                 margin-bottom: 20px;
                 font-size: 1.1em;
             }
-            .feature-list {
+            .tabs {
+                display: flex;
+                justify-content: center;
+                margin-bottom: 20px;
+                border-bottom: 2px solid #eee;
+            }
+            .tab {
+                padding: 12px 24px;
+                cursor: pointer;
+                border-bottom: 3px solid transparent;
+                font-weight: 500;
+                transition: all 0.3s;
+            }
+            .tab.active {
+                border-bottom: 3px solid #667eea;
+                color: #667eea;
+            }
+            .tab-content {
+                display: none;
                 text-align: left;
+            }
+            .tab-content.active {
+                display: block;
+            }
+            .feature-list {
                 background: #f8f9fa;
                 padding: 20px;
                 border-radius: 10px;
@@ -1498,51 +1779,175 @@ async def root():
                 border-radius: 8px;
                 margin: 20px 0;
             }
+            .info-message {
+                color: #856404;
+                background: #fff3cd;
+                padding: 15px;
+                border-radius: 8px;
+                margin: 15px 0;
+                border: 1px solid #ffeaa7;
+            }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🎬 Complete AI Video Generator</h1>
-            <p class="subtitle">Scans ALL folders in your Google Drive + AI-powered video selection</p>
+            <h1>🎬 AI Video Generator v5.2</h1>
+            <p class="subtitle">Fast transcription + smart folder distribution</p>
             
-            <div class="feature-list">
-                <h3>✨ Features:</h3>
-                <ul>
-                    <li>Scans ALL folders and subfolders from Google Drive (no limits)</li>
-                    <li>Transcribes audio with Whisper AI</li>
-                    <li>Selects relevant videos with Gemini AI</li>
-                    <li>Changes video every 3 seconds for dynamic content</li>
-                    <li>Parallel downloading and processing</li>
-                    <li>No authentication needed (public folders only)</li>
-                </ul>
+            <div class="tabs">
+                <div class="tab active" onclick="switchTab('generate')">Generate Video</div>
+                <div class="tab" onclick="switchTab('cache')">Cache Status</div>
+                <div class="tab" onclick="switchTab('scan')">Scan Drive</div>
             </div>
             
-            <div class="upload-area" id="uploadArea">
-                <label class="file-label" for="fileInput">
-                    <div class="upload-icon">📁</div>
-                    <div class="upload-text">Click to upload audio file</div>
-                    <div>or drag and drop here</div>
-                    <div class="file-name" id="fileName">No file selected</div>
-                </label>
-                <input type="file" id="fileInput" accept=".mp3,.wav,.m4a,.aac,.mp4,.mov">
-            </div>
-            
-            <div>
-                <button id="generateBtn" onclick="startGeneration()" disabled>🎬 Generate Video</button>
-                <button id="scanBtn" onclick="scanDrive()">🔍 Scan Drive Only</button>
-            </div>
-            
-            <div class="status-area" id="statusArea">
-                <h3>Processing Status</h3>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="progressFill"></div>
+            <!-- Generate Video Tab -->
+            <div id="generateTab" class="tab-content active">
+                <div class="feature-list">
+                    <h3>✨ How it works (Optimized):</h3>
+                    <ul>
+                        <li>Fast transcription using pre-loaded Whisper base model</li>
+                        <li>Uses cached Google Drive folder structure</li>
+                        <li>Gemini AI decides how many clips from each folder</li>
+                        <li>Random video selection from chosen folders</li>
+                        <li>Creates 3-second clips from selected videos</li>
+                        <li>Generates final video with audio</li>
+                    </ul>
                 </div>
-                <div id="stepDetails"></div>
-                <div id="resultArea"></div>
+                
+                <div id="cacheWarning" class="info-message" style="display: none;">
+                    ⚠️ No drive cache found. Please scan drive first!
+                </div>
+                
+                <div class="upload-area" id="uploadArea">
+                    <label class="file-label" for="fileInput">
+                        <div class="upload-icon">📁</div>
+                        <div class="upload-text">Click to upload audio file</div>
+                        <div>or drag and drop here</div>
+                        <div class="file-name" id="fileName">No file selected</div>
+                    </label>
+                    <input type="file" id="fileInput" accept=".mp3,.wav,.m4a,.aac,.mp4,.mov">
+                </div>
+                
+                <div>
+                    <button id="generateBtn" onclick="startGeneration()" disabled>🎬 Generate Video</button>
+                </div>
+                
+                <div class="status-area" id="statusArea">
+                    <h3>Processing Status</h3>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill"></div>
+                    </div>
+                    <div id="stepDetails"></div>
+                    <div id="resultArea"></div>
+                </div>
+            </div>
+            
+            <!-- Cache Status Tab -->
+            <div id="cacheTab" class="tab-content">
+                <div class="feature-list">
+                    <h3>📁 Cache Information:</h3>
+                    <p>Video generation uses cached Google Drive folder structure. You must scan your drive first before generating videos.</p>
+                </div>
+                
+                <div id="cacheStatusArea">
+                    <div class="step-info">Loading cache status...</div>
+                </div>
+                
+                <div>
+                    <button onclick="checkCacheStatus()">🔄 Check Cache Status</button>
+                </div>
+            </div>
+            
+            <!-- Scan Drive Tab -->
+            <div id="scanTab" class="tab-content">
+                <div class="feature-list">
+                    <h3>🔍 Scan Google Drive:</h3>
+                    <ul>
+                        <li>Scans ALL folders and subfolders from your Google Drive</li>
+                        <li>Builds folder structure with video counts</li>
+                        <li>Saves data to cache for fast video generation</li>
+                        <li>No authentication needed for public folders</li>
+                        <li>Only needs to be done once (or when you add new videos)</li>
+                    </ul>
+                </div>
+                
+                <div>
+                    <button id="scanBtn" onclick="scanDrive()">🔍 Scan Drive Now</button>
+                </div>
+                
+                <div id="scanResultArea"></div>
             </div>
         </div>
         
         <script>
+            // Tab switching
+            function switchTab(tabName) {
+                document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+                
+                event.target.classList.add('active');
+                document.getElementById(tabName + 'Tab').classList.add('active');
+                
+                if (tabName === 'cache') {
+                    checkCacheStatus();
+                }
+            }
+            
+            // Check cache status on page load
+            async function checkCacheStatus() {
+                const cacheStatusArea = document.getElementById('cacheStatusArea');
+                cacheStatusArea.innerHTML = '<div class="step-info">Checking cache...</div>';
+                
+                try {
+                    const response = await fetch('/cache-status');
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        if (data.cache_exists) {
+                            const sizeMB = (data.cache_size / 1024 / 1024).toFixed(2);
+                            cacheStatusArea.innerHTML = `
+                                <div class="success-message">
+                                    <h3>✅ Cache Available</h3>
+                                    <p>File: ${data.cache_file}</p>
+                                    <p>Size: ${sizeMB} MB</p>
+                                    <p>Total Videos: ${data.total_videos}</p>
+                                    <p>Folders with videos: ${data.folders_with_videos}</p>
+                                    <p>Cached at: ${new Date(data.cached_at).toLocaleString()}</p>
+                                    <p>Status: Ready for video generation</p>
+                                </div>
+                            `;
+                            
+                            // Hide cache warning in generate tab
+                            document.getElementById('cacheWarning').style.display = 'none';
+                        } else {
+                            cacheStatusArea.innerHTML = `
+                                <div class="error-message">
+                                    <h3>❌ No Cache Found</h3>
+                                    <p>Please scan your Google Drive first.</p>
+                                </div>
+                            `;
+                            
+                            // Show cache warning in generate tab
+                            document.getElementById('cacheWarning').style.display = 'block';
+                        }
+                    } else {
+                        cacheStatusArea.innerHTML = `
+                            <div class="error-message">
+                                <h3>❌ Error</h3>
+                                <p>${data.error || data.message}</p>
+                            </div>
+                        `;
+                    }
+                } catch (error) {
+                    cacheStatusArea.innerHTML = `
+                        <div class="error-message">
+                            <h3>❌ Connection Error</h3>
+                            <p>${error.message}</p>
+                        </div>
+                    `;
+                }
+            }
+            
             // File upload
             const fileInput = document.getElementById('fileInput');
             const uploadArea = document.getElementById('uploadArea');
@@ -1604,7 +2009,17 @@ async def root():
                 const file = fileInput.files[0];
                 if (!file) return;
                 
-                showStatus('Starting complete video generation...', 10);
+                // Check cache first
+                const cacheCheck = await fetch('/cache-status');
+                const cacheData = await cacheCheck.json();
+                
+                if (!cacheData.success || !cacheData.cache_exists) {
+                    alert('No drive cache found. Please scan your Google Drive first!');
+                    switchTab('scan');
+                    return;
+                }
+                
+                showStatus('Starting video generation...', 10);
                 generateBtn.disabled = true;
                 generateBtn.textContent = 'Processing...';
                 
@@ -1617,7 +2032,10 @@ async def root():
                         body: formData
                     });
                     
-                    if (!response.ok) throw new Error('Failed to start');
+                    if (!response.ok) {
+                        const error = await response.json();
+                        throw new Error(error.detail || 'Failed to start');
+                    }
                     
                     const data = await response.json();
                     taskId = data.task_id;
@@ -1631,37 +2049,52 @@ async def root():
             }
             
             async function scanDrive() {
-                showStatus('Scanning Google Drive (this may take a while)...', 20);
-                document.getElementById('scanBtn').disabled = true;
+                const scanBtn = document.getElementById('scanBtn');
+                const scanResultArea = document.getElementById('scanResultArea');
+                
+                scanResultArea.innerHTML = '<div class="step-info">Scanning Google Drive... This may take several minutes.</div>';
+                scanBtn.disabled = true;
+                scanBtn.textContent = 'Scanning...';
                 
                 try {
                     const response = await fetch('/scan-drive');
                     const data = await response.json();
                     
                     if (data.success) {
-                        let html = `<div class="success-message">
-                            <h3>✅ Drive Scan Complete!</h3>
-                            <p>Total Folders: ${data.total_folders}</p>
-                            <p>Total Videos: ${data.total_videos}</p>
-                            <p>Total Files: ${data.total_files}</p>
-                            <p>Largest Folders:</p>
-                            <ul>`;
+                        scanResultArea.innerHTML = `
+                            <div class="success-message">
+                                <h3>✅ Drive Scan Complete!</h3>
+                                <p>Total Folders: ${data.total_folders}</p>
+                                <p>Total Videos: ${data.total_videos}</p>
+                                <p>Total Files: ${data.total_files}</p>
+                                <p>Folders with videos: ${data.folders_with_videos}</p>
+                                <p>Cache updated and ready for video generation</p>
+                                <p>Scan completed at: ${new Date().toLocaleString()}</p>
+                            </div>
+                        `;
                         
-                        data.largest_folders.forEach(folder => {
-                            html += `<li>${folder.name}: ${folder.video_count} videos</li>`;
-                        });
-                        
-                        html += `</ul></div>`;
-                        
-                        document.getElementById('resultArea').innerHTML = html;
+                        // Update cache status
+                        checkCacheStatus();
                     } else {
-                        showError(data.error);
+                        scanResultArea.innerHTML = `
+                            <div class="error-message">
+                                <h3>❌ Scan Failed</h3>
+                                <p>${data.error || 'Unknown error'}</p>
+                                <p>${data.note || ''}</p>
+                            </div>
+                        `;
                     }
                 } catch (error) {
-                    showError(error.message);
+                    scanResultArea.innerHTML = `
+                        <div class="error-message">
+                            <h3>❌ Connection Error</h3>
+                            <p>${error.message}</p>
+                        </div>
+                    `;
                 }
                 
-                document.getElementById('scanBtn').disabled = false;
+                scanBtn.disabled = false;
+                scanBtn.textContent = '🔍 Scan Drive Now';
             }
             
             function startPolling() {
@@ -1703,11 +2136,14 @@ async def root():
                         }
                         if (status.total_videos_found) {
                             progress = 40;
-                            stepInfo = `📁 Found ${status.total_videos_found} videos in ${status.total_folders || 0} folders`;
+                            stepInfo = `📁 Using ${status.total_videos_found} videos in ${status.folders_with_videos} folders`;
                         }
                         if (status.clips_selected) {
                             progress = 60;
-                            stepInfo = `🤖 Selected ${status.clips_selected} clips: ${status.selection_strategy}`;
+                            stepInfo = `🤖 Gemini distributed ${status.clips_selected} clips across ${status.folders_used || 0} folders`;
+                            if (status.distribution_strategy) {
+                                stepInfo += `<br>Strategy: ${status.distribution_strategy}`;
+                            }
                         }
                         if (status.progress && status.progress.includes('Downloading')) {
                             progress = 70;
@@ -1738,26 +2174,28 @@ async def root():
             
             function showSuccess(status) {
                 const resultArea = document.getElementById('resultArea');
-                resultArea.innerHTML = `
-                    <div class="success-message">
-                        <h3>✅ Video Generated Successfully!</h3>
-                        <p>Duration: ${status.audio_duration ? status.audio_duration.toFixed(1) + 's' : 'N/A'}</p>
-                        <p>Clips used: ${status.clips_selected || 'N/A'}</p>
-                        <p>Drive scanned: ${status.total_videos_found || 'N/A'} videos found</p>
-                        <a href="/download/${taskId}" class="download-link" style="
-                            display: inline-block;
-                            background: #28a745;
-                            color: white;
-                            padding: 12px 30px;
-                            border-radius: 50px;
-                            text-decoration: none;
-                            font-weight: bold;
-                            margin-top: 15px;
-                        " download>
-                            📥 Download Video
-                        </a>
-                    </div>
-                `;
+                let html = `<div class="success-message">
+                    <h3>✅ Video Generated Successfully!</h3>
+                    <p>Audio Duration: ${status.audio_duration ? status.audio_duration.toFixed(1) + 's' : 'N/A'}</p>
+                    <p>Clips Used: ${status.clips_selected || 'N/A'} (3 seconds each)</p>
+                    <p>Folders Used: ${status.folders_used || 'N/A'} out of ${status.folders_with_videos || 'N/A'}</p>
+                    <p>Drive Cache: ${status.total_videos_found || 'N/A'} videos available</p>`;
+                
+                html += `<a href="/download/${taskId}" class="download-link" style="
+                        display: inline-block;
+                        background: #28a745;
+                        color: white;
+                        padding: 12px 30px;
+                        border-radius: 50px;
+                        text-decoration: none;
+                        font-weight: bold;
+                        margin-top: 15px;
+                    " download>
+                        📥 Download Video
+                    </a>`;
+                
+                html += `</div>`;
+                resultArea.innerHTML = html;
             }
             
             function showError(message) {
@@ -1772,7 +2210,11 @@ async def root():
             function resetUI() {
                 generateBtn.disabled = false;
                 generateBtn.textContent = '🎬 Generate Video';
-                document.getElementById('scanBtn').disabled = false;
+            }
+            
+            // Check cache status on page load
+            window.onload = function() {
+                checkCacheStatus();
             }
         </script>
     </body>
@@ -1782,10 +2224,25 @@ async def root():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    print(f"🚀 Starting Complete AI Video Generator API on port {port}")
+    print(f"🚀 Starting AI Video Generator API v5.2 on port {port}")
     print(f"🔗 Access at: http://localhost:{port}")
     print(f"📁 Using Google Drive folder ID: {GOOGLE_DRIVE_FOLDER_ID}")
-    print(f"⚡ Features: Unlimited folder scanning, parallel processing, AI selection")
+    print(f"💾 Cache file: {JSON_CACHE_FILE}")
+    print(f"🤖 Gemini API: {'Configured' if GEMINI_API_KEY else 'NOT CONFIGURED (required)'}")
+    print(f"🗣️ Whisper model: {'base (pre-loaded and ready!)' if WHISPER_MODEL else 'NOT LOADED'}")
+    print(f"⚡ Features:")
+    print(f"  - Whisper base model pre-loaded (fast transcription)")
+    print(f"  - Cache-based folder structure (no expiration)")
+    print(f"  - Gemini AI for folder distribution only")
+    print(f"  - Random video selection from chosen folders")
+    print(f"  - 3-second clips based on audio duration")
+    print(f"  - Manual cache update via /scan-drive")
+    print(f"\n📋 IMPORTANT:")
+    print(f"  1. First scan your drive: http://localhost:{port}/#scan")
+    print(f"  2. Then generate videos using cached folder structure")
+    print(f"  3. Gemini only sees folder names and video counts")
+    print(f"  4. Videos are randomly selected from Gemini-chosen folders")
+    print(f"  5. Whisper model is already loaded - no wait time!")
     
     uvicorn.run(
         "main:app",
