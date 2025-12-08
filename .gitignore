@@ -40,3 +40,4 @@ drive_cache/
 Thumbs.db 
 
 .venv/
+gdrive.json
