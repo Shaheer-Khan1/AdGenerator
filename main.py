@@ -20,6 +20,7 @@ from pathlib import Path
 import asyncio
 import time
 import html
+import sys
 from urllib.parse import unquote, urlparse, parse_qs
 import concurrent.futures
 
@@ -116,6 +117,11 @@ def log_info(message: str):
     """Log a message with timestamp to the terminal."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}")
+
+def log_error(message: str):
+    """Log an error message to stderr with timestamp."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"❌ [{timestamp}] {message}", file=sys.stderr)
 
 
 def log_task(task_id: str, message: str):
@@ -804,8 +810,8 @@ async def select_videos_with_gemini(
         # Calculate total clips needed (3 seconds per clip)
         total_clips_needed = int(math.ceil(audio_duration / 3))
         
-        # Sort folders by video count (descending) and limit
-        sorted_folders = sorted(folder_structure, key=lambda x: x['video_count'], reverse=True)[:30]  # Limit to 30 folders
+        # Sort folders by video count (descending) and include all for maximum relevance
+        sorted_folders = sorted(folder_structure, key=lambda x: x['video_count'], reverse=True)
         
         # Create a mapping for quick lookup
         folder_map = {}
@@ -829,16 +835,16 @@ AUDIO DURATION: {audio_duration:.1f} seconds
 TOTAL CLIPS NEEDED: {total_clips_needed} (3 seconds each)
 
 FOLDER LIST (sorted by video count):
-{chr(10).join([f"{i}. {folder_map[i]['name']} | Videos: {folder_map[i]['video_count']} | Path: {folder_map[i]['full_path'][:50]}" for i in folder_map])}
+{chr(10).join([f"{i}. Name: {folder_map[i]['name']} | Videos: {folder_map[i]['video_count']} | Full Path: {folder_map[i]['full_path']}" for i in folder_map])}
 
 YOUR TASK:
 Distribute {total_clips_needed} clips across these folders based on relevance to the transcript.
-Return JSON with exact format:
+Return JSON with exact format, include a brief reason per folder, and use folder_index numbers that map to the list above (folder names are included for clarity):
 
 {{
   "folder_distribution": [
-    {{"folder_index": 1, "clips_to_take": 5, "reason": "brief reason"}},
-    {{"folder_index": 2, "clips_to_take": 3, "reason": "brief reason"}}
+    {{"folder_index": 1, "clips_to_take": 5, "reason": "why this named folder matches the transcript"}},
+    {{"folder_index": 2, "clips_to_take": 3, "reason": "why this named folder matches the transcript"}}
   ],
   "total_clips": {total_clips_needed}
 }}
@@ -888,12 +894,14 @@ RULES:
                     max_possible = folder_map[folder_idx]['video_count']
                     actual_clips = min(clips_to_take, max_possible)
                     if actual_clips > 0:
+                        folder_name = folder_map[folder_idx]['name']
                         valid_distributions.append({
                             'folder_idx': folder_idx,
                             'clips_to_take': actual_clips,
                             'reason': dist.get('reason', '')
                         })
                         total_distributed += actual_clips
+                        log_info(f"   Gemini: {folder_name} (idx {folder_idx}) -> {actual_clips} clips | reason: {dist.get('reason','')}")
             
             # Adjust if needed
             if total_distributed != total_clips_needed:
@@ -1010,12 +1018,6 @@ RULES:
         log_error(f"❌ Gemini selection failed: {str(e)}")
         raise Exception(f"Gemini video distribution failed: {str(e)}")
 
-# Add this helper function
-def log_error(message: str):
-    """Log error message"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"❌ [{timestamp}] {message}", file=sys.stderr)
-
 # === STEP 4: DOWNLOAD VIDEOS ===
 async def download_drive_videos_batch(
     video_selections: List[Dict[str, Any]],
@@ -1034,6 +1036,7 @@ async def download_drive_videos_batch(
     def download_single_video(video_info: Dict, index: int) -> Optional[Dict]:
         video_name = video_info.get("name", f"video_{index}")
         download_url = video_info.get("download_url")
+        source_folder = video_info.get("source_folder", "unknown_folder")
         
         if not download_url:
             file_id = video_info.get("id")
@@ -1045,7 +1048,7 @@ async def download_drive_videos_batch(
         output_path = task_dir / f"video_{index:03d}_{Path(video_name).stem}.mp4"
         
         try:
-            log_info(f"   [dl-{index}] Preparing download for {video_name} from {download_url}")
+            log_info(f"   [dl-{index}] Preparing download for {video_name} (folder: {source_folder}) from {download_url}")
             session = requests.Session()
             session.headers.update({
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -1053,7 +1056,7 @@ async def download_drive_videos_batch(
             
             for attempt in range(3):
                 try:
-                    log_info(f"   [dl-{index}] Attempt {attempt+1}/3")
+                    log_info(f"   [dl-{index}] Attempt {attempt+1}/3 (folder: {source_folder})")
                     response = session.get(download_url, stream=True, timeout=30)
                     
                     if 'confirm=' in response.url or 'download_warning' in response.url:
@@ -1069,7 +1072,7 @@ async def download_drive_videos_batch(
                                 f.write(chunk)
                     
                     if output_path.exists() and output_path.stat().st_size > 1024:
-                        log_info(f"   [dl-{index}] ✅ Downloaded {video_name} ({output_path.stat().st_size/1024:.1f} KB)")
+                        log_info(f"   [dl-{index}] ✅ Downloaded {video_name} ({output_path.stat().st_size/1024:.1f} KB) from {source_folder}")
                         return {
                             **video_info,
                             "local_path": str(output_path),

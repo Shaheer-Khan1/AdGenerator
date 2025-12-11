@@ -25,7 +25,8 @@ wheels/
 temp_videos/
 output_videos/
 drive_cache/
-
+*.tar
+*.tar.gz
 # Environment variables
 .env
 
